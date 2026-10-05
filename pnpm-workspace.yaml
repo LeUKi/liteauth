@@ -1,0 +1,12 @@
+packages:
+  - apps/*
+  - packages/*
+onlyBuiltDependencies:
+  - esbuild
+  - workerd
+  - sharp
+
+overrides:
+  "@esbuild-kit/core-utils@3.3.2>esbuild": "0.25.12"
+  "miniflare@5.20260815.0-alpha>undici": "7.29.1"
+  "miniflare@5.20260815.0-alpha>sharp": "0.35.4"

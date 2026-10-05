@@ -1,0 +1,38 @@
+{
+  "name": "@liteauth/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run --env=\"\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local --env=\"\""
+  },
+  "dependencies": {
+    "@better-auth/oauth-provider": "1.7.7",
+    "@hono/zod-validator": "^0.8.0",
+    "@liteauth/contracts": "workspace:*",
+    "better-auth": "1.7.7",
+    "drizzle-orm": "0.45.3",
+    "hono": "4.13.13",
+    "openid-client": "6.8.8",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.22.0",
+    "@cloudflare/workers-types": "5.20261005.1",
+    "drizzle-kit": "^0.31.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0",
+    "wrangler": "4.147.0"
+  },
+  "license": "MIT",
+  "author": "lafish",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LeUKi/liteauth.git",
+    "directory": "apps/api"
+  }
+}

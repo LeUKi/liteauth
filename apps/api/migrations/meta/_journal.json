@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1791203656464,
+      "tag": "0000_stale_santa_claus",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791204111482,
+      "tag": "0001_low_shatterstar",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791213590692,
+      "tag": "0002_fast_xorn",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1791214581038,
+      "tag": "0003_little_jocasta",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791215996759,
+      "tag": "0004_familiar_bedlam",
+      "breakpoints": true
+    }
+  ]
+}

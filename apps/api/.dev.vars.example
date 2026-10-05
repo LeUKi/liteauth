@@ -1,0 +1,4 @@
+BETTER_AUTH_SECRET=replace-with-a-random-secret-of-at-least-32-characters
+CREDENTIAL_ENCRYPTION_KEY=replace-with-base64-encoded-32-random-bytes
+CONNECT_CLIENT_ID=your-development-connect-client-id
+CONNECT_CLIENT_SECRET=your-development-connect-client-secret

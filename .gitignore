@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars*
+.env*
+!.env.example
+!.dev.vars.example
+coverage/
+playwright-report/
+test-results/
+.DS_Store
+.omx/
+.secrets/
+*.local
+
+# Per-installation Cloudflare configuration
+**/wrangler.local.jsonc

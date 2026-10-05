@@ -1,0 +1,38 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "liteauth-web-local",
+  "main": "worker.ts",
+  "compatibility_date": "2026-08-22",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "observability": {
+    "enabled": false
+  },
+  "env": {
+    "staging": {
+      "name": "liteauth-staging-web",
+      "routes": [
+        {
+          "pattern": "staging.liteauth.example.com",
+          "custom_domain": true
+        }
+      ]
+    },
+    "production": {
+      "name": "liteauth-production-web",
+      "routes": [
+        {
+          "pattern": "liteauth.example.com",
+          "custom_domain": true
+        }
+      ]
+    }
+  },
+  "account_id": "YOUR_CLOUDFLARE_ACCOUNT_ID",
+  "workers_dev": false,
+  "preview_urls": false
+}
