@@ -4,6 +4,7 @@ import { app } from '../src/index';
 import { open, seal } from '../src/secrets';
 import { disableUser } from '../src/admin';
 import { createAuth } from '../src/auth';
+import { makeSignature } from 'better-auth/crypto';
 
 const alice = { id: 123, username: 'alice', name: 'Alice', avatar_url: null, trust_level: 0, active: true, silenced: false };
 const callbackCookie = (response: Response) => response.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
@@ -108,16 +109,22 @@ describe('upstream login, encrypted binding and callback lifecycle', () => {
     expect(await session.json()).toMatchObject({ user: { linuxdo_id: 123, is_admin: false } });
   });
 
-  it('binds usable self-app credentials encrypted, and reuses the same account across channels', async () => {
-    mockConnect(); const official = await complete(await begin('official', {}));
-    const before = await (await app.request('/api/session', { headers: { Cookie: callbackCookie(official) } }, env)).json() as { user: { id: string } };
+  it('binds usable self-app credentials encrypted, then keeps the same account on permanent official upgrade', async () => {
+    mockConnect();
     const login = await begin('lite', { username: 'alice', client_id: 'alice-connect', client_secret: 'alice-secret' });
     const completed = await complete(login); expect(completed.headers.get('Location')).toBe(`${env.APP_ORIGIN}/apps`);
-    const after = await (await app.request('/api/session', { headers: { Cookie: callbackCookie(completed) } }, env)).json() as { user: { id: string }; login_method: string };
-    expect(after.user.id).toBe(before.user.id); expect(after.login_method).toBe('lite_self_app');
+    const before = await (await app.request('/api/session', { headers: { Cookie: callbackCookie(completed) } }, env)).json() as { user: { id: string }; login_method: string };
+    expect(before.login_method).toBe('lite_self_app');
     const credential = await env.DB.prepare("SELECT ciphertext, version FROM upstream_credential WHERE client_id = 'alice-connect'").first<{ ciphertext: string; version: number }>();
     expect(credential!.ciphertext).not.toContain('alice-secret'); expect(await open(env, credential!.ciphertext, `upstream:alice-connect:v${credential!.version}`)).toBe('alice-secret');
     const reused = await begin('lite', { username: 'alice' }); expect(reused.response.status).toBe(200); expect(reused.url!.searchParams.get('client_id')).toBe('alice-connect');
+    const official = await complete(await begin('official', {}));
+    const after = await (await app.request('/api/session', { headers: { Cookie: callbackCookie(official) } }, env)).json() as { user: { id: string; official_verified_at: string }; login_method: string };
+    expect(after.user.id).toBe(before.user.id); expect(after.login_method).toBe('official_connect'); expect(after.user.official_verified_at).toBeTruthy();
+    expect((await begin('lite', { username: 'alice' })).response.status).toBe(403);
+    expect(await env.DB.prepare("SELECT status,ciphertext FROM upstream_credential WHERE client_id='alice-connect'").first()).toEqual({ status: 'active', ciphertext: credential!.ciphertext });
+    expect((await complete(reused)).headers.get('Location')).toContain('official_login_required');
+    expect(await (await app.request('/api/session', { headers: { Cookie: callbackCookie(completed) } }, env)).json()).toMatchObject({ user: null });
   });
 
   it('keeps the same LiteAuth account when Linux.do username changes and a new self app is submitted', async () => {
@@ -271,8 +278,13 @@ describe('upstream login, encrypted binding and callback lifecycle', () => {
 
   it('does not let a pre-registration candidate restore a credential after the account revokes bindings', async () => {
     mockConnect(); const candidate = await begin('lite', { username: 'alice', client_id: 'alice-connect', client_secret: 'old-candidate' });
-    const official = await complete(await begin('official', {}, candidate.cookie));
-    const cookie = `${candidate.cookie}; ${callbackCookie(official)}`;
+    await insertUser('pre-registration-user', 123, 'alice');
+    await env.DB.prepare(`INSERT INTO auth_event (id,user_id,login_method,upstream_client_id,trust_level,profile,created_at)
+      VALUES ('pre-registration-event','pre-registration-user','lite_self_app','prior-client',0,?,?)`).bind(JSON.stringify(alice), Date.now()).run();
+    const context = await createAuth(env).$context;
+    const session = await context.internalAdapter.createSession('pre-registration-user', false, { authEventId: 'pre-registration-event' }, true);
+    const signed = encodeURIComponent(`${session!.token}.${await makeSignature(session!.token, env.BETTER_AUTH_SECRET)}`);
+    const cookie = `${candidate.cookie}; ${context.authCookies.sessionToken.name}=${signed}`;
     const deletion = await app.request('/api/credentials', { method: 'DELETE', headers: { Cookie: cookie, Origin: env.APP_ORIGIN } }, env); expect(deletion.status).toBe(200);
     expect((await complete(candidate)).headers.get('Location')).toContain('credential_changed');
     expect(await env.DB.prepare("SELECT client_id FROM upstream_credential WHERE client_id = 'alice-connect'").first()).toBeNull();
@@ -357,5 +369,106 @@ describe('upstream login, encrypted binding and callback lifecycle', () => {
     ])).rejects.toThrow();
     expect(await env.DB.prepare('SELECT credential_epoch,credential_revision FROM user WHERE id = ?').bind('legacy-user').first()).toEqual(advanced);
     expect(await env.DB.prepare('SELECT revision FROM credential_clock WHERE id = 1').first()).toEqual(clock);
+  });
+});
+
+describe('official login permanently locks the stable account to that channel', () => {
+  it('blocks hosted and new credentials after verification, preserves the first timestamp, and allows owner deletion', async () => {
+    mockConnect();
+    const lite = await begin('lite', { username: 'alice', client_id: 'alice-connect', client_secret: 'old-secret' });
+    const liteResponse = await complete(lite);
+    const official = await complete(await begin('official', {}));
+    const officialCookie = `${lite.cookie}; ${callbackCookie(official)}`;
+    const original = await env.DB.prepare('SELECT id,official_verified_at FROM user WHERE linuxdo_id=123').first<{ id: string; official_verified_at: number }>();
+    expect(original?.official_verified_at).toBeGreaterThan(0);
+    for (const input of [{ username: 'alice' }, { username: 'renamed', client_id: 'alice-connect', client_secret: 'new-secret' }]) {
+      const rejected = await begin('lite', input);
+      expect(rejected.response.status).toBe(403);
+      expect(await rejected.response.json()).toMatchObject({ error: { code: 'official_login_required' } });
+    }
+    mockConnect({ ...alice, username: 'renamed' });
+    const unknown = await begin('lite', { username: 'renamed', client_id: 'new-unbound', client_secret: 'new-secret' });
+    expect(unknown.response.status).toBe(200);
+    expect((await complete(unknown)).headers.get('Location')).toContain('official_login_required');
+    expect(await env.DB.prepare("SELECT client_id FROM upstream_credential WHERE client_id='new-unbound'").first()).toBeNull();
+    expect(await (await app.request('/api/session', { headers: { Cookie: callbackCookie(liteResponse) } }, env)).json()).toMatchObject({ user: null });
+    const update = await app.request('/api/credentials/verify', { method: 'POST', headers: { Cookie: officialCookie, Origin: env.APP_ORIGIN, 'Content-Type': 'application/json' }, body: JSON.stringify({ client_id: 'another', client_secret: 'another-secret' }) }, env);
+    expect(update.status).toBe(403); expect(await update.json()).toMatchObject({ error: { code: 'official_login_required' } });
+    const summary = await app.request('/api/credentials', { headers: { Cookie: officialCookie } }, env);
+    expect(await summary.json()).toMatchObject({ credential: { client_id: 'alice-connect' } });
+    const later = await complete(await begin('official', {}));
+    expect(later.headers.get('Location')).toBe(`${env.APP_ORIGIN}/apps`);
+    expect(await env.DB.prepare('SELECT id,username,official_verified_at FROM user WHERE linuxdo_id=123').first()).toEqual({ ...original, username: 'renamed' });
+    const deletion = await app.request('/api/credentials', { method: 'DELETE', headers: { Cookie: officialCookie, Origin: env.APP_ORIGIN } }, env);
+    expect(deletion.status).toBe(200);
+    expect(await env.DB.prepare("SELECT status,owner_user_id,ciphertext FROM upstream_credential WHERE client_id='alice-connect'").first()).toEqual({ status: 'revoked', owner_user_id: original!.id, ciphertext: null });
+    expect((await env.DB.prepare('SELECT official_verified_at FROM user WHERE id=?').bind(original!.id).first<{ official_verified_at: number }>())!.official_verified_at).toBe(original!.official_verified_at);
+  });
+
+  it('does not apply another account’s lock when its old username is reused', async () => {
+    mockConnect(); await complete(await begin('official', {}));
+    mockConnect({ ...alice, username: 'alice-renamed' }); await complete(await begin('official', {}));
+    mockConnect({ ...alice, id: 456, username: 'alice' });
+    const login = await begin('lite', { username: 'alice', client_id: 'other-client', client_secret: 'other-secret' });
+    const completed = await complete(login);
+    expect(completed.headers.get('Location')).toBe(`${env.APP_ORIGIN}/apps`);
+    expect(await (await app.request('/api/session', { headers: { Cookie: callbackCookie(completed) } }, env)).json()).toMatchObject({ user: { linuxdo_id: 456, official_verified_at: null }, login_method: 'lite_self_app' });
+    expect((await env.DB.prepare('SELECT official_verified_at FROM user WHERE linuxdo_id=123').first<{ official_verified_at: number }>())!.official_verified_at).toBeGreaterThan(0);
+  });
+
+  it.each(['upstream', 'cancel', 'identity'] as const)('does not lock a Lite account after an unsuccessful %s official verification', async (failure) => {
+    mockConnect(); const lite = await begin('lite', { username: 'alice', client_id: 'alice-connect', client_secret: 'secret' });
+    const initial = await complete(lite);
+    if (failure === 'upstream') mockConnect(alice, false);
+    if (failure === 'identity') mockConnect({ ...alice, id: 456 });
+    const official = await begin('official', {});
+    if (failure === 'identity') await env.DB.prepare("UPDATE connect_transaction SET expected_linuxdo_id=123 WHERE method='official_connect'").run();
+    const completed = failure === 'cancel'
+      ? await app.request(`/auth/connect/callback?error=access_denied&state=${official.url!.searchParams.get('state')}`, { headers: { Cookie: official.cookie } }, env)
+      : await complete(official);
+    expect(completed.headers.get('Location')).toContain('error=');
+    expect(await env.DB.prepare('SELECT official_verified_at FROM user WHERE linuxdo_id=123').first()).toEqual({ official_verified_at: null });
+    expect(await (await app.request('/api/session', { headers: { Cookie: callbackCookie(initial) } }, env)).json()).toMatchObject({ user: { linuxdo_id: 123 }, login_method: 'lite_self_app' });
+    mockConnect(); expect((await begin('lite', { username: 'alice' })).response.status).toBe(200);
+  });
+
+  it('catches an unknown renamed candidate started before the stable account was locked', async () => {
+    mockConnect(); await complete(await begin('lite', { username: 'alice', client_id: 'alice-connect', client_secret: 'old-secret' }));
+    mockConnect({ ...alice, username: 'renamed' });
+    const pending = await begin('lite', { username: 'renamed', client_id: 'unknown-new-client', client_secret: 'candidate-secret' });
+    expect(await env.DB.prepare("SELECT expected_user_id FROM connect_transaction WHERE client_id='unknown-new-client'").first()).toEqual({ expected_user_id: null });
+    await complete(await begin('official', {}));
+    expect((await complete(pending)).headers.get('Location')).toContain('official_login_required');
+    expect(await env.DB.prepare("SELECT client_id FROM upstream_credential WHERE client_id='unknown-new-client'").first()).toBeNull();
+    expect((await env.DB.prepare("SELECT count(*) AS count FROM auth_event WHERE login_method='lite_self_app'").first<{ count: number }>())!.count).toBe(1);
+  });
+
+  it('rolls back a Lite callback batch that loses to successful official verification', async () => {
+    mockConnect(); await complete(await begin('lite', { username: 'alice', client_id: 'alice-connect', client_secret: 'old-secret' }));
+    const pending = await begin('lite', { username: 'alice', client_id: 'replacement-client', client_secret: 'candidate-secret' });
+    const gated = new WeakSet<D1PreparedStatement>();
+    let release!: () => void; let reached!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const waiting = new Promise<void>(resolve => { reached = resolve; });
+    const db = new Proxy(env.DB, { get(target, key) {
+      if (key === 'prepare') return (sql: string) => {
+        const statement = target.prepare(sql);
+        if (!sql.startsWith('INSERT INTO mutation_guard')) return statement;
+        return new Proxy(statement, { get(prepared, property) {
+          if (property === 'bind') return (...values: unknown[]) => { const bound = prepared.bind(...values); gated.add(bound); return bound; };
+          const value = Reflect.get(prepared, property); return typeof value === 'function' ? value.bind(prepared) : value;
+        } });
+      };
+      if (key === 'batch') return async (statements: D1PreparedStatement[]) => { if (statements.some(statement => gated.has(statement))) { reached(); await gate; } return target.batch(statements); };
+      const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    const callback = complete(pending, '', { ...env, DB: db });
+    await waiting;
+    const official = await complete(await begin('official', {})); expect(official.headers.get('Location')).toBe(`${env.APP_ORIGIN}/apps`);
+    release();
+    expect((await callback).headers.get('Location')).toContain('official_login_required');
+    expect(await env.DB.prepare("SELECT client_id FROM upstream_credential WHERE client_id='replacement-client'").first()).toBeNull();
+    expect((await env.DB.prepare("SELECT count(*) AS count FROM auth_event WHERE login_method='lite_self_app'").first<{ count: number }>())!.count).toBe(1);
+    expect(await env.DB.prepare("SELECT ok FROM mutation_guard").first()).toBeNull();
   });
 });

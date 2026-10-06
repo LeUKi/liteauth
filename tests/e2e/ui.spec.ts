@@ -5,7 +5,11 @@ import type { AdminUserSummary, App, AppInput, AppSecretResponse, AuditEntry, Co
 // These tests exercise the frontend with intercepted API responses.
 // They do not establish upstream login, D1 behavior, or production integration.
 const userSession: SessionResponse = {
-  user: { id: 'la_test_user', linuxdo_id: 123, username: 'alice', name: 'Alice', is_admin: false },
+  user: { id: 'la_test_user', linuxdo_id: 123, username: 'alice', name: 'Alice', is_admin: false, official_verified_at: null },
+  login_method: 'lite_self_app',
+};
+const officialSession: SessionResponse = {
+  user: { ...userSession.user!, official_verified_at: '2026-10-05T00:00:01Z' },
   login_method: 'official_connect',
 };
 const fixtureApp: App = {
@@ -42,6 +46,8 @@ type MockState = {
   createInput?: AppInput;
   updateInput?: AppInput;
   officialRequests: number;
+  liteRequests: number;
+  logoutRequests: number;
   appListReads: number;
   secret: AppSecretResponse;
   secretReads: number;
@@ -56,7 +62,7 @@ async function json(route: Route, value: unknown, status = 200) {
 async function mockApi(page: Page, initial: Partial<MockState> = {}, intercept?: Intercept): Promise<MockState> {
   const state: MockState = {
     session: { user: null, login_method: null }, app: structuredClone(fixtureApp), apps: [],
-    credentials: { credential: null }, officialRequests: 0, appListReads: 0,
+    credentials: { credential: null }, officialRequests: 0, liteRequests: 0, logoutRequests: 0, appListReads: 0,
     secret: { status: 'available', client_secret: newSecret }, secretReads: 0, adminUser: structuredClone(fixtureAdminUser), ...initial,
   };
   await page.route('**/api/**', async (route) => {
@@ -64,23 +70,31 @@ async function mockApi(page: Page, initial: Partial<MockState> = {}, intercept?:
     if (intercept && await intercept(route, url, state)) return;
     const method = route.request().method();
     const eligibility: Eligibility = state.session.user
-      ? state.app.lite_only && state.session.login_method !== 'lite_self_app'
+      ? state.app.lite_only && state.session.user.official_verified_at
+        ? { allowed: false, reason: 'official_only_account', trust_level: 1 }
+        : state.app.lite_only && state.session.login_method !== 'lite_self_app'
         ? { allowed: false, reason: 'lite_required', trust_level: 1 }
         : { allowed: true, reason: null, trust_level: 1 }
       : { allowed: false, reason: 'login_required', trust_level: null };
     switch (url.pathname) {
       case '/api/session': return json(route, state.session);
-      case '/api/logout': state.session = { user: null, login_method: null }; return route.fulfill({ status: 204 });
+      case '/api/logout': state.logoutRequests++; state.session = { user: null, login_method: null }; state.context = undefined; return route.fulfill({ status: 204 });
       case '/api/login-context': return json(route, state.context ?? {
         request: url.searchParams.get('request'),
         application: url.searchParams.has('request') ? { id: state.app.id, name: state.app.name, lite_only: state.app.lite_only, min_trust_level: state.app.min_trust_level } : null,
         official_available: !state.app.lite_only,
+        lite_available: !state.session.user?.official_verified_at,
         eligibility,
       });
       case '/api/login/official':
         state.officialRequests++;
         return json(route, { error: { code: 'test_stop', message: '测试停止跳转' } }, 400);
-      case '/api/credentials': return json(route, state.credentials);
+      case '/api/login/lite':
+        state.liteRequests++;
+        return json(route, { error: { code: 'test_stop', message: '测试停止跳转' } }, 400);
+      case '/api/credentials':
+        if (method === 'DELETE') { state.credentials = { credential: null }; return route.fulfill({ status: 204 }); }
+        return json(route, state.credentials);
       case '/api/apps':
         if (method === 'GET') { state.appListReads++; return json(route, { apps: state.apps }); }
         if (method === 'POST') {
@@ -124,7 +138,7 @@ test('official login is natively disabled while policy is pending and after fail
     if (url.pathname !== '/api/login-context') return false;
     await pending;
     if (fail) await json(route, { error: { code: 'context_unavailable', message: '登录方式暂不可用' } }, 400);
-    else await json(route, { request: null, application: null, official_available: true, eligibility: { allowed: false, reason: 'login_required', trust_level: null } });
+    else await json(route, { request: null, application: null, official_available: true, lite_available: true, eligibility: { allowed: false, reason: 'login_required', trust_level: null } });
     return true;
   });
   await page.goto('/login');
@@ -170,8 +184,8 @@ test('global footer shows repository link, plain author credit, version and stab
   expect(await footer.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 
-test('Lite-only policy cannot be overridden by search parameters or an official session', async ({ page }) => {
-  const state = await mockApi(page, { session: userSession, app: { ...fixtureApp, lite_only: true } });
+test('Lite-only policy cannot be overridden by search parameters', async ({ page }) => {
+  const state = await mockApi(page, { app: { ...fixtureApp, lite_only: true } });
   await page.goto('/login?request=request_test&lite_only=false&official_available=true');
   await expect(page.getByRole('heading', { name: '校友网站' })).toBeVisible();
   const official = page.getByRole('button', { name: /非 Lite 用户登录/ });
@@ -183,6 +197,250 @@ test('Lite-only policy cannot be overridden by search parameters or an official 
   await page.keyboard.press('Shift+Tab');
   await expect(official).not.toBeFocused();
   expect(state.officialRequests).toBe(0);
+});
+
+test('a rejected old Lite session requires non-Lite login and natively disables Lite controls', async ({ page }) => {
+  const state = await mockApi(page, { context: {
+    request: null, application: null, official_available: true, lite_available: false,
+    eligibility: { allowed: false, reason: 'official_login_required', trust_level: 1 },
+  } });
+  await page.goto('/credentials');
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。')).toBeVisible();
+  const official = page.getByRole('button', { name: '非 Lite 用户登录', exact: true });
+  const lite = page.getByRole('button', { name: 'Lite 用户登录', exact: true });
+  await expect(official).toBeEnabled();
+  await expect(official).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+  await expect(lite).toBeDisabled();
+  await expect(page.getByLabel('Linux.do 用户名')).toBeDisabled();
+  await expect(page.getByRole('button', { name: '填写 / 更新 Connect 密钥' })).toBeDisabled();
+  await lite.focus();
+  await expect(lite).not.toBeFocused();
+  await page.keyboard.press('Enter');
+  expect(state.liteRequests).toBe(0);
+  await official.click();
+  await expect.poll(() => state.officialRequests).toBe(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('locked accounts have a working way to switch accounts for a Lite-only application', async ({ page }) => {
+  const state = await mockApi(page, { session: officialSession, app: { ...fixtureApp, lite_only: true } });
+  await page.goto('/login?request=request_test&lite_available=true');
+  await expect(page.getByText('此账号不符合该应用的登录要求', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeDisabled();
+  await expect(page.getByRole('link', { name: '继续', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: '返回', exact: true })).toHaveAttribute('href', '/');
+  await page.getByRole('button', { name: '切换账号', exact: true }).click();
+  await expect.poll(() => state.logoutRequests).toBe(1);
+  await expect(page).toHaveURL(/\/login\?request=request_test$/);
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeEnabled();
+  await expect(page.getByLabel('Linux.do 用户名')).toBeEnabled();
+  await expect(page.getByText('此账号不符合该应用的登录要求', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeDisabled();
+  await page.getByLabel('Linux.do 用户名').fill('another_lite_account');
+  await page.getByRole('button', { name: 'Lite 用户登录', exact: true }).click();
+  await expect.poll(() => state.liteRequests).toBe(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('failed account switching preserves the locked policy and supports retry', async ({ page }) => {
+  let fail = true;
+  const state = await mockApi(page, { session: officialSession, app: { ...fixtureApp, lite_only: true } }, async (route, url) => {
+    if (url.pathname !== '/api/logout' || !fail) return false;
+    await json(route, { error: { code: 'request_failed', message: '退出失败，请重试' } }, 500);
+    return true;
+  });
+  await page.goto('/login?request=request_test');
+  await page.getByRole('button', { name: '切换账号', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveText('退出失败，请重试');
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeDisabled();
+  await expect(page.getByText('此账号不符合该应用的登录要求', { exact: true })).toBeVisible();
+  expect(state.session.user?.id).toBe(officialSession.user?.id);
+  fail = false;
+  await page.getByRole('button', { name: '切换账号', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeEnabled();
+});
+
+test('unknown identities stay eligible for Lite validation and lock errors refresh server context', async ({ page }) => {
+  let contextReads = 0;
+  const state = await mockApi(page, {}, async (route, url, current) => {
+    if (url.pathname === '/api/login-context') contextReads++;
+    if (url.pathname !== '/api/login/lite') return false;
+    current.context = {
+      request: null, application: null, official_available: true, lite_available: false,
+      eligibility: { allowed: false, reason: 'official_login_required', trust_level: null },
+    };
+    await json(route, { error: { code: 'official_login_required', message: 'restricted' } }, 403);
+    return true;
+  });
+  await page.goto('/login');
+  const lite = page.getByRole('button', { name: 'Lite 用户登录', exact: true });
+  await expect(lite).toBeEnabled();
+  await page.getByLabel('Linux.do 用户名').fill('alice');
+  await lite.click();
+  await expect(page.getByRole('alert')).toHaveText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。');
+  await expect(lite).toBeDisabled();
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeEnabled();
+  expect(contextReads).toBeGreaterThan(1);
+  expect(state.context?.lite_available).toBe(false);
+  await page.goto('/login?error=official_login_required');
+  await expect(page.getByRole('alert')).toHaveText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。');
+});
+
+test('locked owners can inspect and delete an existing Connect binding but cannot validate one', async ({ page }) => {
+  let verificationRequests = 0;
+  const state = await mockApi(page, { session: officialSession, credentials: { credential: { client_id: 'existing_connect_id', status: 'active', updated_at: '2026-10-05T00:00:00Z' } } }, async (_route, url) => {
+    if (url.pathname === '/api/credentials/verify') verificationRequests++;
+    return false;
+  });
+  await page.goto('/credentials');
+  await expect(page.getByText('existing_connect_id', { exact: true })).toBeVisible();
+  await expect(page.getByText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。')).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制Client ID' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '更新 Connect 密钥' })).toHaveCount(0);
+  await expect(page.getByLabel('Connect Client Secret')).toHaveCount(0);
+  await page.getByRole('button', { name: '删除密钥' }).click();
+  await page.getByRole('alertdialog').getByRole('button', { name: '删除', exact: true }).click();
+  await expect(page.getByRole('alertdialog')).toHaveCount(0);
+  await expect(page.getByText('existing_connect_id', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '提交 Connect 密钥' })).toHaveCount(0);
+  expect(state.credentials.credential).toBeNull();
+  expect(verificationRequests).toBe(0);
+});
+
+test('administrator account views show permanent non-Lite confirmation separately from recent login', async ({ page }) => {
+  await mockApi(page, {
+    session: { ...officialSession, user: { ...officialSession.user!, id: 'la_admin', is_admin: true } },
+    adminUser: { ...fixtureAdminUser, official_verified_at: '2026-10-03T00:00:01Z' },
+  });
+  await page.goto('/admin');
+  const table = page.getByRole('region', { name: '管理员账号列表' });
+  await expect(table.getByText('仅可非 Lite 登录', { exact: true })).toBeVisible();
+  await expect(table.getByText('首次确认：2026/10/03 08:00:01')).toBeVisible();
+  await table.getByRole('link', { name: '@alice', exact: true }).click();
+  await expect(page.getByText('仅可非 Lite 登录', { exact: true })).toBeVisible();
+  const confirmation = page.locator('.value-row').filter({ hasText: '首次非 Lite 确认' });
+  await expect(confirmation).toHaveText('首次非 Lite 确认2026/10/03 08:00:01（UTC+8）');
+  await expect(page.locator('.value-row').filter({ hasText: '最近登录方式' })).toContainText('Lite 用户登录');
+  await expect(page.getByLabel('Client Secret')).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('locked Lite-only consent cannot offer authorization and can return to switch accounts', async ({ page }) => {
+  await mockApi(page, { session: officialSession, app: { ...fixtureApp, lite_only: true } });
+  await page.goto('/consent?request=request_test');
+  await expect(page.getByText('此账号不符合该应用的登录要求', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '允许', exact: true })).toHaveCount(0);
+  await page.getByRole('link', { name: '返回登录', exact: true }).click();
+  await expect(page).toHaveURL(/\/login\?request=request_test$/);
+  await expect(page.getByRole('button', { name: '切换账号', exact: true })).toBeEnabled();
+});
+
+test('credential verification detects a concurrent non-Lite lock and returns to non-Lite login', async ({ page }) => {
+  await mockApi(page, { session: userSession }, async (route, url, current) => {
+    if (url.pathname !== '/api/credentials/verify') return false;
+    current.session = { user: null, login_method: null };
+    current.context = {
+      request: null, application: null, official_available: true, lite_available: false,
+      eligibility: { allowed: false, reason: 'official_login_required', trust_level: null },
+    };
+    await json(route, { error: { code: 'official_login_required', message: '此账号已完成非 Lite 验证，请使用非 Lite 用户登录。' } }, 403);
+    return true;
+  });
+  await page.goto('/credentials');
+  await page.getByLabel('Connect Client ID').fill('candidate_client_id');
+  await page.getByLabel('Connect Client Secret').fill('candidate_client_secret');
+  await page.getByRole('button', { name: '验证并保存' }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。')).toBeVisible();
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeDisabled();
+  await expect(page.getByLabel('Connect Client Secret')).toHaveCount(0);
+});
+
+test('consent detects a concurrent non-Lite lock and stops reusing the old Lite session', async ({ page }) => {
+  await mockApi(page, { session: userSession }, async (route, url, current) => {
+    if (url.pathname !== '/api/consent' || route.request().method() !== 'POST') return false;
+    current.session = { user: null, login_method: null };
+    current.context = {
+      request: 'request_test', application: { id: fixtureApp.id, name: fixtureApp.name, lite_only: false, min_trust_level: 0 },
+      official_available: true, lite_available: false,
+      eligibility: { allowed: false, reason: 'official_login_required', trust_level: null },
+    };
+    await json(route, { error: { code: 'official_login_required', message: '此账号已完成非 Lite 验证，请使用非 Lite 用户登录。' } }, 403);
+    return true;
+  });
+  await page.goto('/consent?request=request_test');
+  await page.getByRole('button', { name: '允许', exact: true }).click();
+  await expect(page).toHaveURL(/\/login\?request=request_test$/);
+  await expect(page.getByText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。')).toBeVisible();
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeEnabled();
+  await expect(page.getByRole('link', { name: '继续', exact: true })).toHaveCount(0);
+});
+
+test('canceled login-context requests offer an escape without reviving the old authorization', async ({ page }) => {
+  const contexts: URL[] = [];
+  await mockApi(page, {}, async (route, url) => {
+    if (url.pathname !== '/api/login-context') return false;
+    contexts.push(url);
+    if (url.searchParams.has('request')) {
+      await json(route, { error: { code: 'request_expired', message: '登录请求已过期，请重新开始' } }, 400);
+    } else {
+      await json(route, { request: null, application: null, official_available: true, lite_available: false, eligibility: { allowed: false, reason: 'official_login_required', trust_level: null } });
+    }
+    return true;
+  });
+  await page.goto('/login?request=canceled_request');
+  await expect(page.getByRole('alert')).toHaveText('登录请求已过期，请重新开始');
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeDisabled();
+  await page.getByRole('link', { name: '返回', exact: true }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeEnabled();
+  await expect(page.getByText('此账号已完成非 Lite 验证，请使用非 Lite 用户登录。')).toBeVisible();
+  await expect(page.getByRole('link', { name: '继续', exact: true })).toHaveCount(0);
+  expect(contexts.at(-1)?.searchParams.has('request')).toBe(false);
+});
+
+test('canceled consent reads offer a request-free return to account management', async ({ page }) => {
+  await mockApi(page, { session: officialSession }, async (route, url) => {
+    if (url.pathname !== '/api/consent') return false;
+    await json(route, { error: { code: 'request_expired', message: '登录请求已过期，请重新开始' } }, 400);
+    return true;
+  });
+  await page.goto('/consent?request=canceled_request');
+  await expect(page.getByRole('alert')).toHaveText('登录请求已过期，请重新开始');
+  await expect(page.getByRole('button', { name: '允许', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: '返回', exact: true })).toHaveAttribute('href', '/login');
+  await page.getByRole('link', { name: '返回', exact: true }).click();
+  await expect(page).toHaveURL(/\/apps$/);
+});
+
+test('canceled consent submissions refresh the locked session and discard the unusable request', async ({ page }) => {
+  let consentSubmissions = 0;
+  const contexts: URL[] = [];
+  await mockApi(page, { session: userSession }, async (route, url, current) => {
+    if (url.pathname === '/api/login-context') {
+      contexts.push(url);
+      await json(route, { request: null, application: null, official_available: true, lite_available: false, eligibility: { allowed: false, reason: 'official_login_required', trust_level: null } });
+      return true;
+    }
+    if (url.pathname !== '/api/consent' || route.request().method() !== 'POST') return false;
+    consentSubmissions++;
+    current.session = { user: null, login_method: null };
+    await json(route, { error: { code: 'request_expired', message: '登录请求已过期，请重新开始' } }, 400);
+    return true;
+  });
+  await page.goto('/consent?request=request_test');
+  await page.getByRole('button', { name: '允许', exact: true }).click();
+  await expect(page).toHaveURL(/\/login\?error=request_expired$/);
+  await expect(page.getByRole('alert')).toHaveText('登录请求已过期，请重新发起');
+  await expect(page.getByRole('button', { name: '非 Lite 用户登录', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Lite 用户登录', exact: true })).toBeDisabled();
+  await expect(page.getByRole('link', { name: '继续', exact: true })).toHaveCount(0);
+  expect(consentSubmissions).toBe(1);
+  expect(contexts.at(-1)?.searchParams.has('request')).toBe(false);
 });
 
 test('missing Lite credentials opens a recoverable credential form', async ({ page }) => {
@@ -281,7 +539,7 @@ test('application policy saves to the server, refetches, and changes subsequent 
 });
 
 test('minimum level persists and server eligibility blocks session reuse and consent', async ({ page }) => {
-  const state = await mockApi(page, { session: userSession, apps: [fixtureApp] });
+  const state = await mockApi(page, { session: officialSession, apps: [fixtureApp] });
   await page.goto(`/apps/${fixtureApp.id}`);
   const level = page.getByLabel('最低等级', { exact: true });
   await expect(level).toHaveValue('0');
@@ -292,7 +550,7 @@ test('minimum level persists and server eligibility blocks session reuse and con
   expect(state.updateInput?.min_trust_level).toBe(3);
   await page.reload();
   await expect(level).toHaveValue('3');
-  state.context = { request: 'request_test', application: { id: state.app.id, name: state.app.name, lite_only: false, min_trust_level: 3 }, official_available: true, eligibility: { allowed: false, reason: 'trust_level_required', trust_level: 1 } };
+  state.context = { request: 'request_test', application: { id: state.app.id, name: state.app.name, lite_only: false, min_trust_level: 3 }, official_available: true, lite_available: false, eligibility: { allowed: false, reason: 'trust_level_required', trust_level: 1 } };
   await page.goto('/login?request=request_test&trust_level=4');
   await expect(page.getByText('此应用要求等级达到 3 级；当前已验证等级：1 级')).toBeVisible();
   await expect(page.getByRole('link', { name: '继续', exact: true })).toHaveCount(0);

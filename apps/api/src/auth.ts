@@ -10,6 +10,8 @@ import { finishConnect } from './connect';
 import { hash } from './crypto';
 import { appEligibility } from './requests';
 import { createAppSecretCapture } from './app-secrets';
+import { OFFICIAL_LOGIN_REQUIRED_MESSAGE } from './account-policy';
+import { HttpError } from './errors';
 
 export type EventRow = { id: string; user_id: string; login_method: string; upstream_client_id: string; trust_level: number | null; profile: string; revoked_at: number | null };
 const userInfoSnapshotKey = '__liteauth_userinfo_snapshot';
@@ -96,13 +98,19 @@ export function createAuth(env: Env, flowClientId?: string, requestId?: string) 
       page: '/login',
       consentReferenceId: async ({ session, user }) => {
         await eventClaims(env, session.authEventId, user.id);
+        const locked = await env.DB.prepare(`SELECT u.id FROM auth_event e JOIN user u ON u.id = e.user_id
+          WHERE e.id = ? AND e.user_id = ? AND e.login_method = 'lite_self_app' AND u.official_verified_at IS NOT NULL`)
+          .bind(session.authEventId, user.id).first();
+        if (locked) throw new APIError('FORBIDDEN', { error: 'official_login_required', message: OFFICIAL_LOGIN_REQUIRED_MESSAGE });
         return String(session.authEventId);
       },
       shouldRedirect: async ({ session, user }) => {
         if (user.disabled) throw new APIError('UNAUTHORIZED');
-        const event = await env.DB.prepare('SELECT login_method, trust_level, revoked_at FROM auth_event WHERE id = ? AND user_id = ?')
-          .bind(session.authEventId, user.id).first<{ login_method: string; trust_level: number | null; revoked_at: number | null }>();
+        const event = await env.DB.prepare(`SELECT e.login_method, e.trust_level, e.revoked_at, u.official_verified_at
+          FROM auth_event e JOIN user u ON u.id = e.user_id WHERE e.id = ? AND e.user_id = ?`)
+          .bind(session.authEventId, user.id).first<{ login_method: string; trust_level: number | null; revoked_at: number | null; official_verified_at: number | null }>();
         if (!event || event.revoked_at !== null) return true;
+        if (event.login_method === 'lite_self_app' && event.official_verified_at !== null) return true;
         if (!flowClientId) return false;
         const settings = await env.DB.prepare('SELECT lite_only, min_trust_level FROM app_settings WHERE client_id = ? AND deleted_at IS NULL')
           .bind(flowClientId).first<{ lite_only: number; min_trust_level: number }>();
@@ -121,6 +129,7 @@ export function createAuth(env: Env, flowClientId?: string, requestId?: string) 
       linuxdoId: { type: 'number', required: true, input: false }, username: { type: 'string', required: true, input: false },
       isAdmin: { type: 'boolean', defaultValue: false, input: false }, disabled: { type: 'boolean', defaultValue: false, input: false },
       credentialEpoch: { type: 'number', defaultValue: 0, input: false },
+      officialVerifiedAt: { type: 'date', required: false, input: false },
     } },
     session: {
       expiresIn: SESSION_TTL, disableSessionRefresh: true, cookieCache: { enabled: false },
@@ -165,6 +174,7 @@ export function createAuth(env: Env, flowClientId?: string, requestId?: string) 
               WHERE r.id = ? AND r.client_id = ? AND r.signed_query = ? AND r.browser_hash = ?
               AND r.auth_event_id = ? AND r.stage = 'login' AND r.status = 'pending' AND r.expires_at > ?
               AND e.user_id = ? AND e.created_at >= ? AND e.revoked_at IS NULL AND u.disabled = 0
+              AND (e.login_method != 'lite_self_app' OR u.official_verified_at IS NULL)
               AND EXISTS (SELECT 1 FROM connect_transaction t WHERE t.request_id = r.id AND t.status = 'completed'
               AND t.method = e.login_method AND t.client_id = e.upstream_client_id AND t.created_at <= e.created_at)
               AND c.disabled = 0 AND a.deleted_at IS NULL AND (a.lite_only = 0 OR e.login_method = 'lite_self_app')
@@ -187,7 +197,9 @@ export function createAuth(env: Env, flowClientId?: string, requestId?: string) 
             method: 'GET', query: z.object({ code: z.string().optional(), state: z.string().optional(), error: z.string().optional() }),
           }, async (ctx) => {
             let redirect: string;
-            try { redirect = await finishConnect(env, ctx); } catch { redirect = `${env.APP_ORIGIN}/login?error=authorization_failed`; }
+            try { redirect = await finishConnect(env, ctx); } catch (error) {
+              redirect = `${env.APP_ORIGIN}/login?error=${error instanceof HttpError && error.code === 'official_login_required' ? 'official_login_required' : 'authorization_failed'}`;
+            }
             throw ctx.redirect(redirect);
           }),
         },

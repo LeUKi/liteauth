@@ -6,6 +6,7 @@ import { disableUser } from '../src/admin';
 import { setAppPolicy } from '../src/db/policy';
 import { getRequest } from '../src/requests';
 import { hash } from '../src/crypto';
+import { officialLockStatements } from '../src/account-policy';
 
 const browser = 'policy-race-browser';
 const client = 'policy-race-client';
@@ -66,6 +67,109 @@ describe('anonymous official authorization policy ordering', () => {
     release();
     await rejected;
     expect((await env.DB.prepare('SELECT id FROM connect_transaction').all()).results).toHaveLength(0);
+  });
+});
+
+async function accountFixture() {
+  await fixture();
+  const context = await createAuth(env).$context;
+  const user = await context.internalAdapter.createUser({ name: 'Alice', email: 'alice@example.invalid', emailVerified: false, linuxdoId: 123, username: 'alice' }, { method: 'linuxdo-connect' });
+  const eventId = 'race-lite-event';
+  await env.DB.prepare(`INSERT INTO auth_event (id,user_id,login_method,upstream_client_id,trust_level,profile,created_at)
+    VALUES (?,?,'lite_self_app','self-client',0,?,?)`).bind(eventId, user.id, JSON.stringify({ id: 123, username: 'alice', trust_level: 0 }), Date.now()).run();
+  const session = await context.internalAdapter.createSession(user.id, false, { authEventId: eventId }, true);
+  await env.DB.prepare('UPDATE authorization_request SET auth_event_id=?').bind(eventId).run();
+  const codeData = { identifier: 'race-code', value: JSON.stringify({ type: 'authorization_code', referenceId: eventId, userId: user.id, query: { client_id: client } }), createdAt: new Date(), updatedAt: new Date(), expiresAt: new Date(Date.now() + 120_000) };
+  const tokenData = { token: 'race-token', clientId: client, sessionId: session!.id, userId: user.id, referenceId: eventId, authorizationCodeId: codeData.identifier, scopes: ['profile'], createdAt: new Date(), expiresAt: new Date(Date.now() + 3600_000) };
+  return { context, user, eventId, session, codeData, tokenData };
+}
+
+function heldDatabase(sqlPrefix: string) {
+  const gated = new WeakSet<D1PreparedStatement>();
+  let release!: () => void; let reached!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const waiting = new Promise<void>(resolve => { reached = resolve; });
+  const db = new Proxy(env.DB, { get(target, key) {
+    if (key === 'prepare') return (sql: string) => {
+      const statement = target.prepare(sql);
+      if (!sql.startsWith(sqlPrefix)) return statement;
+      return new Proxy(statement, { get(prepared, property) {
+        if (property === 'bind') return (...values: unknown[]) => {
+          const bound = prepared.bind(...values);
+          const wrapped = new Proxy(bound, { get(boundTarget, boundProperty) {
+            if (boundProperty === 'run') return async () => { reached(); await gate; return boundTarget.run(); };
+            const value = Reflect.get(boundTarget, boundProperty); return typeof value === 'function' ? value.bind(boundTarget) : value;
+          } });
+          gated.add(wrapped); return wrapped;
+        };
+        const value = Reflect.get(prepared, property); return typeof value === 'function' ? value.bind(prepared) : value;
+      } });
+    };
+    if (key === 'batch') return async (statements: D1PreparedStatement[]) => {
+      if (statements.some(statement => gated.has(statement))) { reached(); await gate; }
+      return target.batch(statements);
+    };
+    const value = Reflect.get(target, key); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  return { db, waiting, release };
+}
+
+describe('permanent account lock commit ordering', () => {
+  it('rechecks the lock when a Lite transaction is inserted after an allowed owner lookup', async () => {
+    const f = await accountFixture();
+    await env.DB.prepare(`INSERT INTO upstream_credential (client_id,owner_user_id,kind,status,created_at,updated_at)
+      VALUES ('bound-race-client',?,'self','active',?,?)`).bind(f.user.id, Date.now(), Date.now()).run();
+    const held = heldDatabase('INSERT INTO connect_transaction');
+    const starting = beginConnect({ ...env, DB: held.db }, browser, 'lite_self_app', { username: 'alice', client_id: 'bound-race-client', client_secret: 'secret' });
+    const rejected = expect(starting).rejects.toMatchObject({ code: 'official_login_required' });
+    await held.waiting; await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now())); held.release(); await rejected;
+    expect(await env.DB.prepare('SELECT id FROM connect_transaction').first()).toBeNull();
+  });
+
+  it('rejects a Lite management session insert that loses to the account lock', async () => {
+    const f = await accountFixture();
+    const held = heldDatabase('INSERT INTO session');
+    const context = await createAuth({ ...env, DB: held.db }).$context;
+    const creating = context.internalAdapter.createSession(f.user.id, false, { authEventId: f.eventId }, true);
+    const rejected = expect(creating).rejects.toMatchObject({ body: { error: 'official_login_required' } });
+    await held.waiting; await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now())); held.release(); await rejected;
+    expect((await env.DB.prepare('SELECT count(*) AS count FROM session').first<{ count: number }>())!.count).toBe(1);
+  });
+
+  it('blocks authorization-code persistence that loses to the account lock', async () => {
+    const f = await accountFixture();
+    const held = heldDatabase('INSERT INTO verification');
+    const context = await createAuth({ ...env, DB: held.db }, client, 'request-before-toggle').$context;
+    const creating = context.adapter.create({ model: 'verification', data: f.codeData });
+    const rejected = expect(creating).rejects.toMatchObject({ body: { error: 'invalid_grant' } });
+    await held.waiting; await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now())); held.release(); await rejected;
+    expect(await env.DB.prepare('SELECT id FROM verification').first()).toBeNull();
+    expect(await env.DB.prepare('SELECT code_id FROM grant_ledger').first()).toBeNull();
+  });
+
+  it('blocks final token persistence that loses to the account lock after code consumption', async () => {
+    const f = await accountFixture();
+    await f.context.adapter.create({ model: 'verification', data: f.codeData });
+    await f.context.internalAdapter.consumeVerificationValue(f.codeData.identifier);
+    const held = heldDatabase('INSERT INTO oauth_access_token');
+    const context = await createAuth({ ...env, DB: held.db }).$context;
+    const creating = context.adapter.create({ model: 'oauthAccessToken', data: f.tokenData });
+    const rejected = expect(creating).rejects.toMatchObject({ body: { error: 'invalid_grant' } });
+    await held.waiting; await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now())); held.release(); await rejected;
+    expect(await env.DB.prepare('SELECT id FROM oauth_access_token').first()).toBeNull();
+    expect(await env.DB.prepare('SELECT state FROM grant_ledger').first()).toEqual({ state: 'canceled' });
+  });
+
+  it('retains a token that commits before the official lock and cancels only the next pending code', async () => {
+    const f = await accountFixture();
+    await f.context.adapter.create({ model: 'verification', data: f.codeData });
+    await f.context.adapter.create({ model: 'oauthAccessToken', data: f.tokenData });
+    await f.context.adapter.create({ model: 'verification', data: { ...f.codeData, identifier: 'next-code' } });
+    await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now()));
+    expect(await env.DB.prepare("SELECT revoked,reference_id FROM oauth_access_token WHERE token='race-token'").first()).toEqual({ revoked: null, reference_id: f.eventId });
+    expect((await env.DB.prepare('SELECT code_id,state FROM grant_ledger ORDER BY code_id').all()).results).toEqual([
+      { code_id: 'next-code', state: 'canceled' }, { code_id: 'race-code', state: 'issued' },
+    ]);
   });
 });
 

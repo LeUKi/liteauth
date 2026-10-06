@@ -13,6 +13,7 @@ export const actionNames: Record<string, string> = {
   'app.created': '创建应用', 'app.updated': '更新应用', 'app.deleted': '删除应用',
   'app.secret_rotated': '轮换应用密钥', 'app.disabled': '停用应用', 'app.enabled': '启用应用',
   'user.disabled': '停用账号', 'user.enabled': '启用账号',
+  'account.official_verified': '确认非 Lite 登录',
   'consent.accepted': '允许授权', 'consent.denied': '拒绝授权',
   'authorization.code_created': '生成授权码', 'authorization.issued': '登录应用',
   'authorization.denied': '拒绝登录应用', 'authorization.failed': '登录应用失败',
@@ -22,6 +23,7 @@ export const actionNames: Record<string, string> = {
 const reasonNames: Record<string, string> = {
   access_denied: '用户拒绝', consent_denied: '用户拒绝', user_denied: '用户拒绝',
   trust_level_required: '等级不足', min_trust_level_changed: '最低等级已调整', lite_required: '仅允许 Lite 用户登录',
+  official_login_required: '仅可非 Lite 登录', official_only_account: '账号不符合应用登录要求',
   policy_changed: '应用要求已更新', app_disabled: '应用已停用', app_deleted: '应用已删除',
   user_disabled: '账号已停用', credential_deleted: 'Connect 密钥已删除', credential_revoked: 'Connect 密钥已撤销',
   account_changed: '账号信息已更新',

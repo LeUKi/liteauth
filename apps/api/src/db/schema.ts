@@ -15,6 +15,7 @@ export const user = sqliteTable('user', {
   credentialEpoch: integer('credential_epoch').notNull().default(0),
   credentialRevision: integer('credential_revision').notNull().default(0),
   lastAuthenticatedAt: timestamp('last_authenticated_at'), lastLoginMethod: text('last_login_method'), lastTrustLevel: integer('last_trust_level'),
+  officialVerifiedAt: timestamp('official_verified_at'),
 });
 
 export const session = sqliteTable('session', {

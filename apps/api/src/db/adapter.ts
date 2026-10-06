@@ -5,6 +5,7 @@ import { randomId } from '../crypto';
 import { authorizationOutcomeStatement } from '../audit';
 import type { createAppSecretCapture } from '../app-secrets';
 import * as schema from './schema';
+import { OFFICIAL_LOGIN_REQUIRED_MESSAGE } from '../account-policy';
 
 type StoredCode = { type?: string; query?: { client_id?: string }; referenceId?: string; userId?: string };
 type Row = Record<string, unknown>;
@@ -12,7 +13,7 @@ const invalidGrant = () => new APIError('BAD_REQUEST', { error: 'invalid_grant',
 const ms = (value: unknown) => value instanceof Date ? value.getTime() : typeof value === 'number' ? value : Date.now();
 const json = (value: unknown) => value == null ? null : JSON.stringify(value);
 
-/** The provider owns protocol parsing. This decorator guards its two durable issuance writes. */
+/** The provider owns protocol parsing. This decorator guards durable session and issuance writes. */
 export function policyAdapter(db: D1Database, requestId?: string, secretCapture?: ReturnType<typeof createAppSecretCapture>) {
   const baseFactory = drizzleAdapter(drizzle(db, { schema }), { provider: 'sqlite', schema, transaction: false });
 
@@ -20,6 +21,24 @@ export function policyAdapter(db: D1Database, requestId?: string, secretCapture?
     const wrapped: DBAdapter = {
       ...base,
       async create<T extends Row, R = T>({ model, data, select, forceAllowId }: { model: string; data: Omit<T, 'id'>; select?: string[]; forceAllowId?: boolean }): Promise<R> {
+        if (model === 'session') {
+          const id = typeof data.id === 'string' ? data.id : randomId();
+          const result = await db.prepare(`INSERT INTO session
+            (id, token, user_id, expires_at, created_at, updated_at, ip_address, user_agent, auth_event_id)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM auth_event e JOIN user u ON u.id = e.user_id
+            WHERE e.id = ? AND e.user_id = ? AND e.revoked_at IS NULL AND u.disabled = 0
+            AND (e.login_method != 'lite_self_app' OR u.official_verified_at IS NULL)`)
+            .bind(id, data.token, data.userId, ms(data.expiresAt), ms(data.createdAt), ms(data.updatedAt),
+              data.ipAddress ?? null, data.userAgent ?? null, data.authEventId, data.authEventId, data.userId).run();
+          if (result.meta.changes !== 1) {
+            const locked = await db.prepare(`SELECT u.id FROM user u JOIN auth_event e ON e.user_id = u.id
+              WHERE u.id = ? AND e.id = ? AND e.login_method = 'lite_self_app' AND u.official_verified_at IS NOT NULL`)
+              .bind(data.userId, data.authEventId).first();
+            if (locked) throw new APIError('FORBIDDEN', { error: 'official_login_required', message: OFFICIAL_LOGIN_REQUIRED_MESSAGE });
+            throw new APIError('UNAUTHORIZED', { error: 'session_unavailable' });
+          }
+          return { ...data, id } as unknown as R;
+        }
         if (model === 'oauthClient' && typeof data.clientSecret === 'string') {
           if (!secretCapture || typeof data.clientId !== 'string') throw new APIError('INTERNAL_SERVER_ERROR');
           const secretCiphertext = await secretCapture.seal(data.clientId, data.clientSecret);
@@ -40,6 +59,7 @@ export function policyAdapter(db: D1Database, requestId?: string, secretCapture?
               SELECT ?, ?, ?, ?, ?, ? FROM auth_event e JOIN user u ON u.id = e.user_id
               JOIN oauth_client c ON c.client_id = ? JOIN app_settings a ON a.client_id = c.client_id
               WHERE e.id = ? AND e.user_id = ? AND e.revoked_at IS NULL AND u.disabled = 0 AND c.disabled = 0 AND a.deleted_at IS NULL
+              AND (e.login_method != 'lite_self_app' OR u.official_verified_at IS NULL)
               AND (? IS NULL OR EXISTS (SELECT 1 FROM authorization_request r WHERE r.id = ? AND r.client_id = c.client_id
               AND r.auth_event_id = e.id AND r.status IN ('pending', 'processing') AND r.expires_at > ?))
               AND (a.lite_only = 0 OR e.login_method = 'lite_self_app') AND e.trust_level >= a.min_trust_level`)
@@ -66,6 +86,7 @@ export function policyAdapter(db: D1Database, requestId?: string, secretCapture?
               JOIN session s ON s.id = ? AND s.auth_event_id = e.id
               WHERE g.code_id = ? AND g.state = 'pending' AND g.client_id = ? AND g.auth_event_id = ?
               AND g.expires_at > ? AND s.expires_at > ? AND e.revoked_at IS NULL AND u.disabled = 0 AND c.disabled = 0 AND a.deleted_at IS NULL
+              AND (e.login_method != 'lite_self_app' OR u.official_verified_at IS NULL)
               AND e.user_id = ? AND (a.lite_only = 0 OR e.login_method = 'lite_self_app') AND e.trust_level >= a.min_trust_level`)
               .bind(id, data.token, data.clientId, data.sessionId ?? null, data.userId ?? null, data.referenceId,
                 data.authorizationCodeId, json(data.resources), json(data.requestedUserInfoClaims), ms(data.expiresAt), ms(data.createdAt),

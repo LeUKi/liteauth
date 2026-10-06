@@ -10,8 +10,9 @@ import { audit } from './db/policy';
 import { authorizationOutcomeStatement } from './audit';
 import { connectOutcomeStatement, type VerifiedConnectIdentity } from './connect-audit';
 import { startUpstream, finishUpstream } from './upstream';
+import { OFFICIAL_LOGIN_REQUIRED_MESSAGE, officialLockStatements } from './account-policy';
 
-type ExistingUser = { id: string; linuxdo_id: number; username: string; credential_epoch: number; credential_revision?: number; disabled: number };
+type ExistingUser = { id: string; linuxdo_id: number; username: string; credential_epoch: number; credential_revision?: number; disabled: number; official_verified_at?: number | null };
 type CredentialRow = { client_id: string; owner_user_id: string | null; kind: string; ciphertext: string | null; version: number; status: string; updated_at: number };
 type Payload = { secret: string; state: string; codeVerifier: string; returnTo: '/apps' | '/credentials' };
 type TransactionRow = {
@@ -32,7 +33,7 @@ export async function reservePlatformClient(env: Env) {
 }
 
 async function userById(env: Env, id: string) {
-  return env.DB.prepare('SELECT id, linuxdo_id, username, credential_epoch, credential_revision, disabled FROM user WHERE id = ?')
+  return env.DB.prepare('SELECT id, linuxdo_id, username, credential_epoch, credential_revision, disabled, official_verified_at FROM user WHERE id = ?')
     .bind(id).first<ExistingUser>();
 }
 
@@ -48,7 +49,7 @@ export async function beginConnect(env: Env, browserToken: string, method: Login
   let credentialVersion: number | null = null;
   const candidate = Boolean(credentialInput || input.client_id);
   if (method === 'lite_self_app') {
-    if (expectedUser && expectedUser.credential_revision === undefined) expectedUser = await userById(env, expectedUser.id) ?? expectedUser;
+    if (expectedUser && (expectedUser.credential_revision === undefined || expectedUser.official_verified_at === undefined)) expectedUser = await userById(env, expectedUser.id) ?? expectedUser;
     const supplied = credentialInput ?? (input.client_id && input.client_secret ? { client_id: input.client_id, client_secret: input.client_secret } : undefined);
     if (supplied) {
       clientId = supplied.client_id; secret = supplied.client_secret;
@@ -60,7 +61,7 @@ export async function beginConnect(env: Env, browserToken: string, method: Login
       }
     } else {
       invariant(input.username, 404, 'credentials_required', '请填写你的 Connect 密钥');
-      const matches = await env.DB.prepare(`SELECT u.id, u.linuxdo_id, u.username, u.credential_epoch, u.credential_revision, u.disabled,
+      const matches = await env.DB.prepare(`SELECT u.id, u.linuxdo_id, u.username, u.credential_epoch, u.credential_revision, u.disabled, u.official_verified_at,
         k.client_id, k.owner_user_id, k.kind, k.ciphertext, k.version, k.status, k.updated_at
         FROM user u JOIN upstream_credential k ON k.owner_user_id = u.id
         WHERE lower(u.username) = lower(?) AND k.status = 'active' AND k.kind = 'self' LIMIT 2`)
@@ -69,12 +70,14 @@ export async function beginConnect(env: Env, browserToken: string, method: Login
       expectedUser = matches.results[0];
       const credential = matches.results[0];
       invariant(!expectedUser.disabled, 403, 'account_disabled', '此账号暂不可用');
+      invariant(expectedUser.official_verified_at == null, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
       invariant(credential?.ciphertext, 404, 'credentials_required', '请填写你的 Connect 密钥');
       clientId = credential.client_id;
       credentialVersion = credential.version;
       secret = await open<string>(env, credential.ciphertext, `upstream:${clientId}:v${credential.version}`);
     }
     invariant(!expectedUser?.disabled, 403, 'account_disabled', '此账号暂不可用');
+    invariant(expectedUser?.official_verified_at == null, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
   }
   invariant(clientId && secret && !clientId.startsWith('PLACEHOLDER') && !secret.startsWith('PLACEHOLDER'), 503, 'connect_unavailable', '登录暂不可用，请稍后再试');
   const callback = `${env.APP_ORIGIN}/auth/connect/callback`;
@@ -87,7 +90,8 @@ export async function beginConnect(env: Env, browserToken: string, method: Login
     (id, state_hash, browser_hash, request_id, method, client_id, encrypted_payload, expected_user_id, expected_linuxdo_id,
     expected_username, credential_epoch, credential_version, candidate, started_credential_revision, status, created_at, expires_at)
     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'lite_self_app' THEN (SELECT revision FROM credential_clock WHERE id = 1) ELSE NULL END, 'pending', ?, ?
-    WHERE (? != 'lite_self_app' OR EXISTS (SELECT 1 FROM credential_clock WHERE id = 1)) AND (? IS NULL OR EXISTS (
+    WHERE (? != 'lite_self_app' OR (EXISTS (SELECT 1 FROM credential_clock WHERE id = 1)
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM user WHERE id = ? AND disabled = 0 AND official_verified_at IS NULL)))) AND (? IS NULL OR EXISTS (
       SELECT 1 FROM authorization_request r JOIN oauth_client c ON c.client_id = r.client_id
       JOIN app_settings a ON a.client_id = c.client_id
       WHERE r.id = ? AND r.browser_hash = ? AND r.status = 'pending' AND r.expires_at > ?
@@ -97,7 +101,11 @@ export async function beginConnect(env: Env, browserToken: string, method: Login
       method === 'lite_self_app' && !expectedUser ? input.username ?? null : null,
       expectedUser?.credential_epoch ?? null, credentialVersion, Number(candidate),
       method, now, now + TRANSACTION_TTL,
-      method, input.request ?? null, input.request ?? null, browserHash, now, method).run();
+      method, expectedUser?.id ?? null, expectedUser?.id ?? null, input.request ?? null, input.request ?? null, browserHash, now, method).run();
+  if (inserted.meta.changes !== 1 && method === 'lite_self_app' && expectedUser) {
+    const current = await userById(env, expectedUser.id);
+    invariant(current?.official_verified_at == null, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
+  }
   invariant(inserted.meta.changes === 1, 400, 'request_expired', '登录请求已过期，请重新开始');
   return { redirect_url: upstream.authorizationUrl };
 }
@@ -115,6 +123,14 @@ export async function finishConnect(env: Env, ctx: CallbackContext) {
   const transaction = await env.DB.prepare(`UPDATE connect_transaction SET status = 'consumed' WHERE state_hash = ?
     AND browser_hash = ? AND status = 'pending' AND expires_at > ? RETURNING *`)
     .bind(await hash(state), await hash(browserToken), Date.now()).first<TransactionRow>();
+  if (!transaction) {
+    const locked = await env.DB.prepare(`SELECT t.id FROM connect_transaction t JOIN user u ON
+      u.id = t.expected_user_id OR u.linuxdo_id = t.expected_linuxdo_id OR u.id IN
+      (SELECT owner_user_id FROM upstream_credential WHERE client_id = t.client_id AND kind = 'self')
+      WHERE t.state_hash = ? AND t.browser_hash = ? AND t.method = 'lite_self_app'
+      AND t.status = 'canceled' AND u.official_verified_at IS NOT NULL`).bind(await hash(state), await hash(browserToken)).first();
+    invariant(!locked, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
+  }
   invariant(transaction?.encrypted_payload, 400, 'request_expired', '登录请求已过期，请重新开始');
   const downstreamClientId = transaction.request_id
     ? (await env.DB.prepare('SELECT client_id FROM authorization_request WHERE id = ?').bind(transaction.request_id).first<{ client_id: string }>())?.client_id
@@ -165,6 +181,7 @@ export async function finishConnect(env: Env, ctx: CallbackContext) {
     const userId = savedUser.id;
     verifiedIdentity.user_id = userId;
     verifiedUserId = userId;
+    invariant(transaction.method !== 'lite_self_app' || savedUser.official_verified_at == null, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
     const expectedEpoch = transaction.method === 'lite_self_app' ? transaction.credential_epoch : null;
     invariant(transaction.method !== 'lite_self_app' || transaction.started_credential_revision !== null, 400, 'credential_changed', 'Connect 密钥已变更，请重新开始');
     invariant(transaction.method !== 'lite_self_app' || (savedUser.credential_revision ?? 0) <= transaction.started_credential_revision!, 400, 'credential_changed', 'Connect 密钥已变更，请重新开始');
@@ -174,6 +191,7 @@ export async function finishConnect(env: Env, ctx: CallbackContext) {
     const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO mutation_guard (id, ok)
       SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM connect_transaction t JOIN user u ON u.id = ? WHERE t.id = ?
       AND t.status = 'consumed' AND t.expires_at > ? AND u.disabled = 0
+      AND (t.method != 'lite_self_app' OR u.official_verified_at IS NULL)
       AND (t.method != 'lite_self_app' OR (t.started_credential_revision IS NOT NULL AND u.credential_revision <= t.started_credential_revision))
       AND (? IS NULL OR u.credential_epoch = ?)
       AND (? IS NULL OR EXISTS (SELECT 1 FROM upstream_credential k WHERE k.client_id = t.client_id
@@ -210,9 +228,11 @@ export async function finishConnect(env: Env, ctx: CallbackContext) {
           Number(isConfiguredAdmin(env, profile.id)), now, transaction.method, profile.trust_level, userId),
       connectOutcomeStatement(env.DB, "t.id = ? AND t.status IN ('pending','consumed')", [transaction.id], 'success', null, verifiedIdentity),
       env.DB.prepare("UPDATE connect_transaction SET status = 'completed', encrypted_payload = NULL WHERE id = ?").bind(transaction.id),
-      env.DB.prepare('DELETE FROM mutation_guard WHERE id IN (?, ?)').bind(guardId, `${guardId}_binding`),
     );
     if (transaction.request_id) statements.push(env.DB.prepare("UPDATE authorization_request SET auth_event_id = ? WHERE id = ? AND status = 'pending'").bind(eventId, transaction.request_id));
+    // Bind the current official request first; canceling older Lite work must not cancel this new flow.
+    if (transaction.method === 'official_connect') statements.push(...officialLockStatements(env.DB, userId, now));
+    statements.push(env.DB.prepare('DELETE FROM mutation_guard WHERE id IN (?, ?)').bind(guardId, `${guardId}_binding`));
     await env.DB.batch(statements);
     const user = await ctx.context.internalAdapter.findUserById(userId);
     invariant(user, 400, 'account_unavailable', '登录暂不可用');
@@ -225,7 +245,7 @@ export async function finishConnect(env: Env, ctx: CallbackContext) {
     });
     if (!transaction.request_id) return `${env.APP_ORIGIN}${payload.returnTo}`;
     const { app } = await getRequest(env, transaction.request_id, browserToken);
-    if (!appEligibility(app, { login_method: transaction.method, trust_level: profile.trust_level }).allowed) {
+    if (!appEligibility(app, { login_method: transaction.method, trust_level: profile.trust_level, official_verified_at: transaction.method === 'official_connect' ? now : null }).allowed) {
       // The identity and credential have been verified. Keep this management session, but let the
       // login page show the current level and offer a new verification instead of issuing a grant.
       await audit(env.DB, 'authorization.failed', userId, app.client_id, {
@@ -236,7 +256,11 @@ export async function finishConnect(env: Env, ctx: CallbackContext) {
     }
     return `${env.APP_ORIGIN}/auth/resume?request=${transaction.request_id}`;
   } catch (error) {
-    const code = error instanceof APIError ? 'authorization_failed' : error instanceof Error && 'code' in error ? String(error.code) : 'authorization_failed';
+    let code = error instanceof APIError ? (error.body?.error === 'official_login_required' ? 'official_login_required' : 'authorization_failed') : error instanceof Error && 'code' in error ? String(error.code) : 'authorization_failed';
+    if (transaction.method === 'lite_self_app' && verifiedUserId) {
+      const current = await userById(env, verifiedUserId);
+      if (current?.official_verified_at != null) code = 'official_login_required';
+    }
     await env.DB.batch([
       connectOutcomeStatement(env.DB, "t.id = ? AND t.status IN ('pending','consumed')", [transaction.id], 'failed', code, verifiedIdentity),
       env.DB.prepare("UPDATE connect_transaction SET status = 'canceled', encrypted_payload = NULL WHERE id = ? AND status != 'completed'").bind(transaction.id),

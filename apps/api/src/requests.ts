@@ -9,9 +9,11 @@ export type AuthorizationRequestRow = {
 
 export type DownstreamAppPolicy = { lite_only: number | boolean; min_trust_level: number };
 
-export function appEligibility(policy: DownstreamAppPolicy, event: { login_method: string; trust_level: number | null } | null) {
+export function appEligibility(policy: DownstreamAppPolicy, event: { login_method: string; trust_level: number | null; official_verified_at?: number | null } | null) {
   const trustLevel = event?.trust_level ?? null;
   if (!event) return { allowed: false, reason: 'login_required' as const, trust_level: null };
+  if (event.official_verified_at != null && policy.lite_only) return { allowed: false, reason: 'official_only_account' as const, trust_level: trustLevel };
+  if (event.official_verified_at != null && event.login_method === 'lite_self_app') return { allowed: false, reason: 'official_login_required' as const, trust_level: trustLevel };
   if (policy.lite_only && event.login_method !== 'lite_self_app') return { allowed: false, reason: 'lite_required' as const, trust_level: trustLevel };
   if (trustLevel === null || trustLevel < policy.min_trust_level) return { allowed: false, reason: 'trust_level_required' as const, trust_level: trustLevel };
   return { allowed: true, reason: null, trust_level: trustLevel };

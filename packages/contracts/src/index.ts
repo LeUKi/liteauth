@@ -11,6 +11,7 @@ export const userSchema = z.object({
   avatar_url: z.string().nullable().optional(),
   is_admin: z.boolean(),
   disabled: z.boolean().optional(),
+  official_verified_at: z.string().nullable(),
 });
 export type User = z.infer<typeof userSchema>;
 export type AdminUserSummary = User & {
@@ -69,8 +70,8 @@ export const liteLoginSchema = z.object({
 export type LiteLoginInput = z.infer<typeof liteLoginSchema>;
 export type Credential = { client_id: string; updated_at: string; status: 'active' | 'revoked' };
 export type CredentialsResponse = { credential: Credential | null };
-export type Eligibility = { allowed: boolean; reason: 'login_required' | 'lite_required' | 'trust_level_required' | null; trust_level: number | null };
-export type LoginContext = { request: string | null; application: Pick<App, 'id' | 'name' | 'lite_only' | 'min_trust_level'> | null; official_available: boolean; eligibility: Eligibility };
+export type Eligibility = { allowed: boolean; reason: 'login_required' | 'lite_required' | 'trust_level_required' | 'official_only_account' | 'official_login_required' | null; trust_level: number | null };
+export type LoginContext = { request: string | null; application: Pick<App, 'id' | 'name' | 'lite_only' | 'min_trust_level'> | null; official_available: boolean; lite_available: boolean; eligibility: Eligibility };
 export type RedirectResponse = { redirect_url: string };
 export type ConsentContext = { request: string; application: Pick<App, 'id' | 'name' | 'lite_only' | 'min_trust_level'>; scopes: string[]; login_method: LoginMethod; eligibility: Eligibility };
 export type ApiError = { error: { code: string; message: string } };

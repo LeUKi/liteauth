@@ -106,7 +106,7 @@ describe('browser-bound public authorization facade', () => {
     const authorize = await app.request(`/oauth2/authorize?${parameters}`, { headers: { Cookie: cookie } }, env); expect(authorize.status).toBe(302);
     const id = new URL(authorize.headers.get('Location')!).searchParams.get('request')!;
     const browserCookie = cookieFrom(authorize); const combinedCookie = `${cookie}; ${browserCookie}`;
-    expect((await app.request(`/api/consent?request=${id}`, { headers: { Cookie: 'liteauth.browser=other' } }, env)).status).toBe(400);
+    expect((await app.request(`/api/consent?request=${id}`, { headers: { Cookie: `${cookie}; liteauth.browser=other` } }, env)).status).toBe(400);
     await setAppPolicy(env.DB, client.app.client_id, true); await setAppPolicy(env.DB, client.app.client_id, false);
     expect((await app.request(`/api/consent?request=${id}`, { headers: { Cookie: combinedCookie } }, env)).status).toBe(400);
     expect(await env.DB.prepare('SELECT id FROM oauth_access_token').first()).toBeNull();

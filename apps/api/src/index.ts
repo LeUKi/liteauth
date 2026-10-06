@@ -15,8 +15,10 @@ import { createApp, deleteApp, getApp, listApps, readAppSecret, rotateAppSecret,
 import { disableApp, disableUser, listAudit, listLoginRecords, listUsers, getAdminUser, listUserApps, listConnectRecords, parseAdminUserFilters, parseAdminConnectFilters } from './admin';
 import { cleanup, cleanupHistory, HISTORY_CRON } from './cleanup';
 import { audit, authorizationOutcomeStatement, parseAuditFilters } from './audit';
+import { OFFICIAL_LOGIN_REQUIRED_MESSAGE } from './account-policy';
 
-type Variables = { auth: LiteAuth; checkedSession?: AuthSession | null; browserToken?: string };
+type SessionEvent = { login_method: LoginMethod; trust_level: number | null; official_verified_at: number | null };
+type Variables = { auth: LiteAuth; checkedSession?: AuthSession | null; knownSessionEvent?: SessionEvent | null; browserToken?: string };
 type AppEnv = { Bindings: Env; Variables: Variables };
 type Ctx = Context<AppEnv>;
 const app = new Hono<AppEnv>();
@@ -61,21 +63,25 @@ async function sessionOf(c: Ctx, required = false) {
   if (c.get('checkedSession') === undefined) {
     const session = await c.get('auth').api.getSession({ headers: c.req.raw.headers });
     if (session) {
-      const valid = await c.env.DB.prepare(`SELECT e.id FROM auth_event e JOIN user u ON u.id = e.user_id
+      const event = await c.env.DB.prepare(`SELECT e.login_method, e.trust_level, u.official_verified_at FROM auth_event e JOIN user u ON u.id = e.user_id
         WHERE e.id = ? AND e.user_id = ? AND e.revoked_at IS NULL AND u.disabled = 0`)
-        .bind(session.session.authEventId, session.user.id).first();
-      c.set('checkedSession', valid ? session : null);
+        .bind(session.session.authEventId, session.user.id).first<SessionEvent>();
+      // Retain only a UI policy hint for the rejected cookie, never management authority.
+      c.set('knownSessionEvent', event);
+      c.set('checkedSession', event && !(event.login_method === 'lite_self_app' && event.official_verified_at !== null) ? session : null);
     } else c.set('checkedSession', null);
   }
   const value = c.get('checkedSession') ?? null;
-  if (required) invariant(value, 401, 'login_required', '请先登录');
+  if (required) {
+    invariant(value || c.get('knownSessionEvent')?.official_verified_at == null, 401, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
+    invariant(value, 401, 'login_required', '请先登录');
+  }
   return value;
 }
 
 async function sessionEvent(c: Ctx) {
   const session = await sessionOf(c);
-  return session ? c.env.DB.prepare('SELECT login_method, trust_level FROM auth_event WHERE id = ? AND user_id = ? AND revoked_at IS NULL')
-    .bind(session.session.authEventId, session.user.id).first<{ login_method: LoginMethod; trust_level: number | null }>() : null;
+  return session ? c.get('knownSessionEvent') ?? null : null;
 }
 
 function browserToken(c: Ctx) {
@@ -167,13 +173,18 @@ app.get('/api/session', async (c) => {
   const session = await sessionOf(c);
   if (!session) return c.json({ user: null, login_method: null });
   const event = await c.env.DB.prepare('SELECT login_method FROM auth_event WHERE id = ?').bind(session.session.authEventId).first<{ login_method: LoginMethod }>();
-  return c.json({ user: { id: session.user.id, linuxdo_id: session.user.linuxdoId, username: session.user.username, name: session.user.name, avatar_url: session.user.image ?? null, is_admin: session.user.isAdmin, disabled: session.user.disabled }, login_method: event?.login_method ?? null });
+  const verifiedAt = c.get('knownSessionEvent')?.official_verified_at;
+  return c.json({ user: { id: session.user.id, linuxdo_id: session.user.linuxdoId, username: session.user.username, name: session.user.name, avatar_url: session.user.image ?? null, is_admin: session.user.isAdmin, disabled: session.user.disabled,
+    official_verified_at: verifiedAt == null ? null : new Date(verifiedAt).toISOString() }, login_method: event?.login_method ?? null });
 });
 app.get('/api/login-context', async (c) => {
   const id = c.req.query('request');
-  if (!id) { browserToken(c); return c.json({ request: null, application: null, official_available: true, eligibility: appEligibility({ lite_only: 0, min_trust_level: 0 }, await sessionEvent(c)) }); }
+  await sessionOf(c);
+  const event = c.get('knownSessionEvent') ?? null;
+  const liteAvailable = event?.official_verified_at == null;
+  if (!id) { browserToken(c); return c.json({ request: null, application: null, official_available: true, lite_available: liteAvailable, eligibility: appEligibility({ lite_only: 0, min_trust_level: 0 }, event) }); }
   const { app: downstream } = await getRequest(c.env, id, browserToken(c));
-  return c.json({ request: id, application: { id: downstream.id, name: downstream.name, lite_only: Boolean(downstream.lite_only), min_trust_level: downstream.min_trust_level }, official_available: !downstream.lite_only, eligibility: appEligibility(downstream, await sessionEvent(c)) });
+  return c.json({ request: id, application: { id: downstream.id, name: downstream.name, lite_only: Boolean(downstream.lite_only), min_trust_level: downstream.min_trust_level }, official_available: !downstream.lite_only, lite_available: liteAvailable, eligibility: appEligibility(downstream, event) });
 });
 app.post('/api/login/official', async (c) => {
   const input = await safeInput(c, officialLoginSchema);
@@ -183,6 +194,8 @@ app.post('/api/login/official', async (c) => {
 app.post('/api/login/lite', async (c) => {
   const input = await safeInput(c, liteLoginSchema);
   await rateLimit(c.env.DB, `login:${c.req.header('CF-Connecting-IP') ?? await hash(browserToken(c))}`, 15);
+  await sessionOf(c);
+  invariant(c.get('knownSessionEvent')?.official_verified_at == null, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
   return c.json(await beginConnect(c.env, browserToken(c), 'lite_self_app', input));
 });
 app.get('/auth/connect/callback', async (c) => {
@@ -192,8 +205,8 @@ app.get('/auth/connect/callback', async (c) => {
 app.get('/auth/resume', async (c) => {
   const id = c.req.query('request');
   invariant(id, 400, 'invalid_request', '登录请求无效');
-  const { request, app: downstream } = await getRequest(c.env, id, browserToken(c));
   const session = await sessionOf(c, true);
+  const { request, app: downstream } = await getRequest(c.env, id, browserToken(c));
   invariant(session && request.auth_event_id === session.session.authEventId, 400, 'identity_mismatch', '登录账号已变化，请重新开始');
   const response = await createAuth(c.env, downstream.client_id, id).handler(new Request(`${c.env.APP_ORIGIN}/api/auth/connect/resume`, {
     method: 'POST', headers: jsonHeaders(c),
@@ -211,8 +224,9 @@ app.post('/api/credentials/verify', async (c) => {
   const session = await sessionOf(c, true);
   const input = await safeInput(c, credentialInputSchema);
   await rateLimit(c.env.DB, `verify:${session!.user.id}`, 10);
-  const user = await c.env.DB.prepare('SELECT id, linuxdo_id, username, credential_epoch, disabled FROM user WHERE id = ?').bind(session!.user.id).first<{ id: string; linuxdo_id: number; username: string; credential_epoch: number; disabled: number }>();
+  const user = await c.env.DB.prepare('SELECT id, linuxdo_id, username, credential_epoch, official_verified_at, disabled FROM user WHERE id = ?').bind(session!.user.id).first<{ id: string; linuxdo_id: number; username: string; credential_epoch: number; official_verified_at: number | null; disabled: number }>();
   invariant(user, 401, 'login_required', '请先登录');
+  invariant(user.official_verified_at === null, 403, 'official_login_required', OFFICIAL_LOGIN_REQUIRED_MESSAGE);
   return c.json(await beginConnect(c.env, browserToken(c), 'lite_self_app', { username: user.username }, user, input));
 });
 app.delete('/api/credentials', async (c) => { const session = await sessionOf(c, true); await revokeCredentials(c.env, session!.user.id); return c.json({ ok: true }); });
@@ -243,8 +257,8 @@ app.post('/api/admin/users/:id/disable', async (c) => { const session = await se
 app.post('/api/admin/apps/:id/disable', async (c) => { const session = await sessionOf(c, true); const input = await safeInput(c, disableInputSchema); await disableApp(c.env, session!.user.id, c.req.param('id'), input.disabled); return c.json({ ok: true }); });
 app.get('/api/consent', async (c) => {
   const id = c.req.query('request'); invariant(id, 400, 'invalid_request', '授权请求无效');
-  const { request, app: downstream } = await getRequest(c.env, id, browserToken(c));
   const session = await sessionOf(c, true);
+  const { request, app: downstream } = await getRequest(c.env, id, browserToken(c));
   invariant(request.stage === 'consent' && request.auth_event_id === session!.session.authEventId, 400, 'request_expired', '授权请求已变化，请重新开始');
   const event = await sessionEvent(c);
   invariant(event, 401, 'login_required', '请先登录');
@@ -252,11 +266,11 @@ app.get('/api/consent', async (c) => {
 });
 app.post('/api/consent', async (c) => {
   const input = await safeInput(c, consentInputSchema);
-  const { request, app: downstream } = await getRequest(c.env, input.request, browserToken(c));
   const session = await sessionOf(c, true);
+  const { request, app: downstream } = await getRequest(c.env, input.request, browserToken(c));
   invariant(request.stage === 'consent' && request.auth_event_id === session!.session.authEventId, 400, 'request_expired', '授权请求已变化，请重新开始');
   const eligibility = appEligibility(downstream, await sessionEvent(c));
-  invariant(!input.accept || eligibility.allowed, 403, eligibility.reason ?? 'policy_changed', eligibility.reason === 'trust_level_required' ? `此应用要求等级达到 ${downstream.min_trust_level} 级` : '此应用仅支持 Lite 登录');
+  invariant(!input.accept || eligibility.allowed, 403, eligibility.reason ?? 'policy_changed', eligibility.reason === 'trust_level_required' ? `此应用要求等级达到 ${downstream.min_trust_level} 级` : eligibility.reason === 'official_only_account' ? '此账号不符合该应用的登录要求' : eligibility.reason === 'official_login_required' ? OFFICIAL_LOGIN_REQUIRED_MESSAGE : '此应用仅支持 Lite 登录');
   const claimed = await c.env.DB.prepare("UPDATE authorization_request SET status = 'processing' WHERE id = ? AND status = 'pending' RETURNING id").bind(input.request).first();
   invariant(claimed, 400, 'request_expired', '授权请求已过期，请重新开始');
   const response = await createAuth(c.env, downstream.client_id, input.request).handler(new Request(`${c.env.APP_ORIGIN}/api/auth/oauth2/consent`, {

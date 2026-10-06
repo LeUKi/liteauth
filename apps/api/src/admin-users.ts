@@ -48,9 +48,10 @@ function nextCursor(rows: { id: string; created_at: number }[], limit: number): 
 type UserRow = {
   id: string; linuxdo_id: number; username: string; name: string; image: string | null; is_admin: number; disabled: number;
   connect_client_id: string | null; last_login_method: string | null; last_trust_level: number | null; last_authenticated_at: number | null; created_at: number;
+  official_verified_at: number | null;
 };
 const userSelect = `SELECT u.id,u.linuxdo_id,u.username,u.name,u.image,u.is_admin,u.disabled,u.created_at,
-  u.last_authenticated_at,u.last_login_method,u.last_trust_level,
+  u.last_authenticated_at,u.last_login_method,u.last_trust_level,u.official_verified_at,
   (SELECT c.client_id FROM upstream_credential c WHERE c.owner_user_id=u.id AND c.kind='self' AND c.status='active') AS connect_client_id
   FROM user u`;
 
@@ -59,6 +60,7 @@ function presentUser(row: UserRow): AdminUserSummary {
   return { id: row.id, linuxdo_id: row.linuxdo_id, username: row.username, name: row.name, avatar_url: row.image,
     is_admin: Boolean(row.is_admin), disabled: Boolean(row.disabled), connect_client_id: row.connect_client_id,
     last_login_method: method, last_trust_level: row.last_trust_level,
+    official_verified_at: row.official_verified_at === null ? null : new Date(row.official_verified_at).toISOString(),
     last_authenticated_at: row.last_authenticated_at === null ? null : new Date(row.last_authenticated_at).toISOString(),
     created_at: new Date(row.created_at).toISOString() };
 }

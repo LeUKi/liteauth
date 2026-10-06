@@ -8,6 +8,7 @@ import { setAppPolicy } from '../src/db/policy';
 import { randomId } from '../src/crypto';
 import { app } from '../src/index';
 import type { LoginMethod } from '@liteauth/contracts';
+import { officialLockStatements } from '../src/account-policy';
 
 const redirectUri = 'https://rp.example/callback';
 async function fixture(method: LoginMethod = 'official_connect', clientType: 'confidential' | 'public' = 'confidential', trustLevel = 0) {
@@ -228,22 +229,23 @@ describe('real Better Auth / Drizzle / D1 authorization flow', () => {
     expect((await env.DB.prepare('SELECT count(*) AS count FROM grant_ledger').first<{ count: number }>())?.count).toBe(0);
   });
 
-  it('issues opaque tokens, verifies signed OIDC tokens, and retains immutable provenance after a method switch', async () => {
-    const f = await fixture();
+  it('issues opaque tokens, verifies signed OIDC tokens, and retains issued Lite provenance after official upgrade', async () => {
+    const f = await fixture('lite_self_app');
     const code = await authorization(f);
     const expiry = await env.DB.prepare('SELECT created_at, expires_at FROM verification').first<{ created_at: number; expires_at: number }>();
     expect(expiry!.expires_at - expiry!.created_at).toBeLessThanOrEqual(121_000);
-    const liteEvent = randomId('ae_');
-    await env.DB.prepare('INSERT INTO auth_event (id, user_id, login_method, upstream_client_id, trust_level, profile, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .bind(liteEvent, f.user.id, 'lite_self_app', 'alice-client', 4, JSON.stringify({ id: 123, username: 'alice', name: 'Alice', trust_level: 4 }), Date.now()).run();
-    await f.context.internalAdapter.createSession(f.user.id, false, { authEventId: liteEvent }, true);
     const response = await redeem(f, code); expect(response.status).toBe(200);
     const tokens = await response.json() as { access_token: string; id_token: string; refresh_token?: string };
+    const officialEvent = randomId('ae_');
+    await env.DB.prepare('INSERT INTO auth_event (id, user_id, login_method, upstream_client_id, trust_level, profile, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .bind(officialEvent, f.user.id, 'official_connect', 'platform-client', 4, JSON.stringify({ id: 123, username: 'alice', name: 'Alice', trust_level: 4 }), Date.now()).run();
+    await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now()));
+    await f.context.internalAdapter.createSession(f.user.id, false, { authEventId: officialEvent }, true);
     expect(tokens.access_token.split('.')).toHaveLength(1); expect(tokens.refresh_token).toBeUndefined();
     const stored = await env.DB.prepare('SELECT reference_id FROM oauth_access_token').first<{ reference_id: string }>();
     expect(stored?.reference_id).toBe(f.eventId);
     const info = await userinfo(f, tokens.access_token); expect(info.status).toBe(200);
-    expect(await info.json()).toMatchObject({ sub: f.user.id, id: 123, username: 'alice', login_method: 'official_connect', upstream_client_id: 'platform-client', liteauth_user_id: f.user.id });
+    expect(await info.json()).toMatchObject({ sub: f.user.id, id: 123, username: 'alice', login_method: 'lite_self_app', upstream_client_id: 'alice-client', liteauth_user_id: f.user.id });
     const decode = (value: string) => Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), character => character.charCodeAt(0));
     const [protectedHeader, payload, signature] = tokens.id_token.split('.');
     const header = JSON.parse(new TextDecoder().decode(decode(protectedHeader))) as { kid: string; alg: string };
@@ -253,7 +255,7 @@ describe('real Better Auth / Drizzle / D1 authorization flow', () => {
     const jwk = jwks.keys.find(key => key.kid === header.kid)!;
     const publicKey = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
     expect(await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, decode(signature), new TextEncoder().encode(`${protectedHeader}.${payload}`))).toBe(true);
-    expect(claims).toMatchObject({ iss: `${env.APP_ORIGIN}/api/auth`, aud: f.client.app.client_id, nonce: 'rp-nonce', sub: f.user.id, login_method: 'official_connect', id: 123 });
+    expect(claims).toMatchObject({ iss: `${env.APP_ORIGIN}/api/auth`, aud: f.client.app.client_id, nonce: 'rp-nonce', sub: f.user.id, login_method: 'lite_self_app', id: 123 });
     expect(claims.email).toBeUndefined();
   });
 
@@ -545,5 +547,70 @@ describe('minimum verified level admission', () => {
     const ledger = await env.DB.prepare('SELECT state FROM grant_ledger').first<{ state: string }>();
     expect(ledger?.state).toBe(response.ok ? 'issued' : 'canceled');
     expect((await env.DB.prepare('SELECT count(*) AS count FROM oauth_access_token').first<{ count: number }>())?.count).toBe(response.ok ? 1 : 0);
+  });
+});
+
+describe('official account lock with native OAuth handling', () => {
+  it('keeps previously issued Lite OAuth/OIDC claims valid while redirecting the stale Lite management cookie', async () => {
+    const f = await fixture('lite_self_app');
+    const issued = await redeem(f, await authorization(f));
+    expect(issued.status).toBe(200);
+    const tokens = await issued.json() as { access_token: string; id_token: string };
+    const claimsBefore = JSON.parse(atob(tokens.id_token.split('.')[1].replaceAll('-', '+').replaceAll('_', '/'))) as Record<string, unknown>;
+    await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now()));
+    await env.DB.prepare("UPDATE user SET username='renamed',name='New name',last_login_method='official_connect' WHERE id=?").bind(f.user.id).run();
+    const info = await userinfo(f, tokens.access_token);
+    expect(info.status).toBe(200);
+    expect(await info.json()).toMatchObject({ sub: f.user.id, username: 'alice', login_method: 'lite_self_app', trust_level: 0 });
+    const compatible = await app.request('/api/user', { headers: { Authorization: `Bearer ${tokens.access_token}` } }, env);
+    expect(compatible.status).toBe(200);
+    expect(await compatible.json()).toMatchObject({ id: 123, username: 'alice', login_method: 'lite_self_app' });
+    const claimsAfter = JSON.parse(atob(tokens.id_token.split('.')[1].replaceAll('-', '+').replaceAll('_', '/'))) as Record<string, unknown>;
+    expect(claimsAfter).toEqual(claimsBefore); expect(claimsAfter.login_method).toBe('lite_self_app');
+    expect((await env.DB.prepare('SELECT revoked_at FROM auth_event WHERE id=?').bind(f.eventId).first<{ revoked_at: number | null }>())!.revoked_at).toBeNull();
+    expect(await env.DB.prepare('SELECT id FROM session WHERE id=?').bind(f.session.id).first()).toBeTruthy();
+    const management = await app.request('/api/session', { headers: f.headers }, env);
+    expect(await management.json()).toMatchObject({ user: null });
+    const query = new URLSearchParams({ client_id: f.client.app.client_id, redirect_uri: redirectUri, response_type: 'code', scope: 'openid profile', code_challenge: await oidc.calculatePKCECodeChallenge(oidc.randomPKCECodeVerifier()), code_challenge_method: 'S256' });
+    const native = await f.auth.handler(new Request(`${env.APP_ORIGIN}/api/auth/oauth2/authorize?${query}`, { headers: f.headers }));
+    expect(native.status).toBe(200);
+    const prompt = await native.json() as { url: string };
+    expect(new URL(prompt.url, env.APP_ORIGIN).pathname).toBe('/login');
+    const snapshot = await eventClaims(env, f.eventId, f.user.id);
+    expect(snapshot.login_method).toBe('lite_self_app');
+  });
+
+  it('blocks old consent confirmation and code persistence after the account lock', async () => {
+    const f = await fixture('lite_self_app');
+    const query = new URLSearchParams({ client_id: f.client.app.client_id, redirect_uri: redirectUri, response_type: 'code', scope: 'profile', code_challenge: await oidc.calculatePKCECodeChallenge(oidc.randomPKCECodeVerifier()), code_challenge_method: 'S256' });
+    const response = await f.auth.handler(new Request(`${env.APP_ORIGIN}/api/auth/oauth2/authorize?${query}`, { headers: f.headers }));
+    const prompt = await response.json() as { url: string };
+    expect(new URL(prompt.url, env.APP_ORIGIN).pathname).toBe('/consent');
+    await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now()));
+    const consent = await f.auth.handler(new Request(`${env.APP_ORIGIN}/api/auth/oauth2/consent`, {
+      method: 'POST', headers: { ...Object.fromEntries(f.headers), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accept: true, oauth_query: new URL(prompt.url, env.APP_ORIGIN).searchParams.toString() }),
+    }));
+    expect(consent.status).toBe(403);
+    expect(await consent.json()).toMatchObject({ error: 'official_login_required' });
+    expect(await env.DB.prepare('SELECT id FROM verification').first()).toBeNull();
+    expect(await env.DB.prepare('SELECT id FROM oauth_access_token').first()).toBeNull();
+  });
+
+  it('permanently cancels an already-consumed pending code while preserving prior token issuance', async () => {
+    const f = await fixture('lite_self_app');
+    const prior = await redeem(f, await authorization(f)); expect(prior.status).toBe(200);
+    const priorTokens = await prior.json() as { access_token: string };
+    await authorization(f);
+    const pending = await env.DB.prepare("SELECT code_id FROM grant_ledger WHERE state='pending'").first<{ code_id: string }>();
+    expect(await f.context.internalAdapter.consumeVerificationValue(pending!.code_id)).toBeTruthy();
+    await env.DB.batch(officialLockStatements(env.DB, f.user.id, Date.now()));
+    await expect(f.context.adapter.create({ model: 'oauthAccessToken', data: {
+      token: 'late-lite-token', clientId: f.client.app.client_id, sessionId: f.session.id, userId: f.user.id,
+      referenceId: f.eventId, authorizationCodeId: pending!.code_id, scopes: ['profile'], createdAt: new Date(), expiresAt: new Date(Date.now() + 3600_000),
+    } })).rejects.toMatchObject({ body: { error: 'invalid_grant' } });
+    expect(await env.DB.prepare('SELECT state FROM grant_ledger WHERE code_id=?').bind(pending!.code_id).first()).toEqual({ state: 'canceled' });
+    expect((await env.DB.prepare('SELECT count(*) AS count FROM oauth_access_token').first<{ count: number }>())!.count).toBe(1);
+    expect((await userinfo(f, priorTokens.access_token)).status).toBe(200);
   });
 });

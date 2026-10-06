@@ -1,0 +1,1 @@
+ALTER TABLE `user` ADD `official_verified_at` integer;

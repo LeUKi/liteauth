@@ -8,7 +8,7 @@ LiteAuth 是独立的 Linux.do Connect 接入服务：同时支持平台 Connect
 
 ## 功能
 
-- 非 Lite 用户登录与 Lite 用户登录，按 Linux.do 稳定数字 ID 关联账号，支持用户名变更。
+- 非 Lite 用户登录与 Lite 用户登录，按 Linux.do 稳定数字 ID 关联账号，支持用户名变更。账号成功完成非 Lite 验证后，只能继续使用非 Lite 登录；此前签发的 Lite 令牌自然到期。
 - 加密托管用户提交的上游 Connect 凭据，验证、更新与撤销。
 - 创建下游服务端应用或浏览器 / 原生应用，管理回调、密钥、Lite-only 与 0～4 级准入。
 - 授权码流程、PKCE、不透明 Access Token、OIDC ID Token、Discovery 和 JWKS。

@@ -84,7 +84,7 @@ export function AdminUserDetailPage() {
   const user = detail.data?.user;
   const disable = useMutation({ mutationFn: () => api.admin.disableUser(userId, !user?.disabled), onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin'] }) });
   return <Page><PageHeading title={user ? `@${user.username}` : '账号详情'} back={<Link to="/admin" className="back-link"><ArrowLeft size={15} />管理账号</Link>} />{detail.isPending ? <Loading /> : detail.isError ? <QueryError error={detail.error} retry={detail.refetch} /> : user && <div className="stack section-stack">
-    <Panel><div className="panel-heading"><h2>账号资料</h2><div className="app-row-badges">{user.is_admin && <span className="badge">管理员</span>}<span className={`badge ${user.disabled ? '' : 'badge-green'}`}>{user.disabled ? '已停用' : '正常'}</span></div></div>
+    <Panel><div className="panel-heading"><h2>账号资料</h2><div className="app-row-badges">{user.is_admin && <span className="badge">管理员</span>}<span className={`badge ${user.disabled ? '' : 'badge-green'}`}>{user.disabled ? '已停用' : '正常'}</span>{user.official_verified_at && <span className="badge">仅可非 Lite 登录</span>}</div></div>
       <ValueRow label="Linux.do 用户名" value={`@${user.username}`} />
       <ValueRow label="显示名称" value={user.name || user.username} />
       <ValueRow label="Linux.do ID" value={String(user.linuxdo_id)} copy />
@@ -93,6 +93,7 @@ export function AdminUserDetailPage() {
       <ValueRow label="最近验证等级" value={user.last_trust_level === null ? '未验证' : `${user.last_trust_level} 级`} />
       <ValueRow label="最近登录方式" value={loginMethodName(user.last_login_method)} />
       <ValueRow label="最近验证时间" value={user.last_authenticated_at ? `${formatRecordDate(user.last_authenticated_at)}（UTC+8）` : '未验证'} />
+      {user.official_verified_at && <ValueRow label="首次非 Lite 确认" value={`${formatRecordDate(user.official_verified_at)}（UTC+8）`} />}
       <ValueRow label="创建时间" value={`${formatRecordDate(user.created_at)}（UTC+8）`} />
       <div className="panel-footer"><Confirm title={user.disabled ? '启用账号？' : '停用账号？'} description={user.disabled ? '此账号将恢复登录。' : '此账号将无法继续登录和授权。'} confirmLabel={user.disabled ? '启用' : '停用'} onConfirm={() => disable.mutateAsync()}><Button variant="secondary" disabled={user.id === session.data?.user?.id || disable.isPending}>{user.disabled ? '启用账号' : '停用账号'}</Button></Confirm></div>
     </Panel>

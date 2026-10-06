@@ -117,6 +117,7 @@ export function followRedirect(response: RedirectResponse) {
 }
 
 export function errorMessage(error: unknown): string {
+  if (error instanceof ApiFailure && error.code === 'official_login_required') return '此账号已完成非 Lite 验证，请使用非 Lite 用户登录。';
   return error instanceof ApiFailure ? error.message : '操作失败，请重试';
 }
 
