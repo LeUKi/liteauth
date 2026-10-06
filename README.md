@@ -70,3 +70,7 @@ pnpm deploy:production --skip-build
 - [第三方许可证](THIRD_PARTY_NOTICES.md)
 
 下游接入地址与可返回字段也可以在应用详情页直接查看。New API 实际联调仍延期。
+
+## 友情链接
+
+- [Linux.do](https://linux.do/)
