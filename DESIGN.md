@@ -47,7 +47,7 @@
 - Spacing/layout rhythm: 4px 基础节奏；控件间距 8–16px，面板间距 24px；桌面页面最大宽度约 1040px，登录面板约 440px；桌面内边距 24px，手机 16px。
 - Shape/radius/elevation: 面板约 12px 圆角，控件约 8px；主要使用细边框，只给浮层和弹窗轻阴影。
 - Motion: 常规约 160ms，短淡入与小幅位移、轻微按钮按压；无视差、弹跳或自动装饰。使用动态导入 features 的 LazyMotion 和 `domAnimation`；安全禁用、请求、导航与焦点转移立即执行。
-- Footer: 全站共享页脚常驻显示 `LiteAuth · by lafish · v0.1.0 · build @ <Unix 秒级时间戳>`。品牌和作者指向开源仓库 `https://github.com/LeUKi/liteauth`。页脚使用很浅的灰 `#a8ada5`、12px、小间距和无底色样式；悬停轻微加深，键盘焦点保持可辨认。构建时间由 Vite 构建开始时注入，同一产物在刷新、导航和部署到不同环境时保持不变。
+- Footer: 全站共享页脚常驻显示 `LiteAuth · Made with ❤️ by lafish · v0.1.0 · build @ <Unix 秒级时间戳>`。仅品牌指向开源仓库 `https://github.com/LeUKi/liteauth`，作者说明为不可点击的纯文本。页脚使用很浅的灰 `#a8ada5`、12px、小间距和无底色样式；品牌链接悬停轻微加深，键盘焦点保持可辨认。构建时间由 Vite 构建开始时注入，同一产物在刷新、导航和部署到不同环境时保持不变。
 - Imagery/iconography: 不需要图片；图标仅用于复制、外链、关闭、刷新等真实操作，并配备可访问名称。直接展示的下游密钥不需要显示／隐藏切换。
 
 ## Components

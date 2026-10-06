@@ -4,7 +4,7 @@
 - 日期：2026-10-06
 - 仓库：<https://github.com/LeUKi/liteauth>
 - 许可证：MIT，适用于 LiteAuth 自有代码
-- 本地提交：单一根提交，消息为 `chore: prepare LiteAuth for MIT open source`；精确 ID 使用 `git rev-parse HEAD` 查看
+- 初始基线提交：`f5a816e`，消息为 `chore: prepare LiteAuth for MIT open source`；后续补丁单独提交
 
 ## 本次内容
 
@@ -38,3 +38,11 @@
 Cookie 修复要求已登录的管理站用户重新登录，不撤销已经签发的下游令牌。本轮没有重新执行真人 Connect 登录；实际 HTTP 协议回归使用 staging 合成会话。New API 联调与人工真实改名测试均沿用既定延期／豁免。
 
 生产回滚、数据库恢复及主密钥轮换没有在本轮演练。GitHub Private vulnerability reporting 尚未确认启用，仓库公开前必须核验；本次交付止于本地提交，不包含远端推送或公开仓库。
+
+## 2026-10-06 后续页脚补丁
+
+作者说明改为纯文本 `Made with ❤️ by lafish`，仅 LiteAuth 品牌保留仓库链接。版本仍为 `0.1.0`，该次构建时间为 `1791249866`。
+
+本次仅发布 Web Worker：先 staging，再将同一产物发布到 production。Lint、前端类型检查、生产构建和两项桌面／移动端页脚回归通过；两个环境的登录、404、错误页及线上 JS／CSS 哈希检查通过。
+
+补丁和开源初始基线推送到 `LeUKi/liteauth` 的 `main`。远端仓库本次创建为私有，公开发布及公开前安全设置核验另行执行。

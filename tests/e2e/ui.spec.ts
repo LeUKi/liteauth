@@ -142,13 +142,14 @@ test('official login is natively disabled while policy is pending and after fail
   await expect(official).toBeEnabled();
 });
 
-test('global footer shows repository links, version and stable build timestamp', async ({ page }) => {
+test('global footer shows repository link, plain author credit, version and stable build timestamp', async ({ page }) => {
   await mockApi(page);
   await page.goto('/login');
   const footer = page.getByRole('contentinfo', { name: '站点信息' });
-  await expect(footer).toContainText(/LiteAuth\s*·\s*by lafish\s*·\s*v0\.1\.0\s*·\s*build @ \d{10}/);
+  await expect(footer).toContainText(/LiteAuth\s*·\s*Made with ❤️ by lafish\s*·\s*v0\.1\.0\s*·\s*build @ \d{10}/);
   await expect(footer.getByRole('link', { name: 'LiteAuth' })).toHaveAttribute('href', 'https://github.com/LeUKi/liteauth');
-  await expect(footer.getByRole('link', { name: 'by lafish' })).toHaveAttribute('href', 'https://github.com/LeUKi/liteauth');
+  await expect(footer.getByRole('link')).toHaveCount(1);
+  await expect(footer.getByRole('link', { name: /lafish/ })).toHaveCount(0);
   await expect(footer).toHaveCSS('color', 'rgb(168, 173, 165)');
   const buildText = await footer.textContent();
   await page.clock.setFixedTime(new Date('2035-01-01T00:00:00Z'));

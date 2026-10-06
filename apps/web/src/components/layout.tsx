@@ -11,7 +11,7 @@ export function SiteFooter() {
   return (
     <footer className="site-footer" aria-label="站点信息">
       <span className="site-footer-segment"><a href={repositoryUrl} target="_blank" rel="noopener noreferrer">LiteAuth</a></span>
-      <span className="site-footer-segment"><span aria-hidden="true">· </span><a href={repositoryUrl} target="_blank" rel="noopener noreferrer">by lafish</a></span>
+      <span className="site-footer-segment"><span aria-hidden="true">· </span>Made with ❤️ by lafish</span>
       <span className="site-footer-segment"><span aria-hidden="true">· </span>v{__LITEAUTH_VERSION__}</span>
       <span className="site-footer-segment"><span aria-hidden="true">· </span>build @ {__LITEAUTH_BUILD_TIME__}</span>
     </footer>
