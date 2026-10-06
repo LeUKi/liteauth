@@ -57,7 +57,9 @@ pnpm deploy:production --dry-run --skip-build
 pnpm deploy:production --skip-build
 ```
 
-发布脚本检查管理员 ID、域名、路由与环境隔离，不自动执行数据库迁移或导入密钥。需要重新构建时先重新发布 staging，再用 `--skip-build` 发布 production。
+发布脚本检查管理员 ID、域名、路由、Web → API Service Binding 与环境隔离，不自动执行数据库迁移或导入密钥。生产同时核对 staging 的静态产物、Web Worker 入口源码及锁文件；需要重新构建或修改转发代码时先重新发布 staging，再用 `--skip-build` 发布 production。
+
+部署在同一 Cloudflare Zone 的下游 Worker 也可以使用公开的 OAuth/OIDC 地址。LiteAuth 的 Web Worker 通过内部 Service Binding 转发接口请求，接入者无需配置 LiteAuth 的绑定权限。调用方兼容标志与云端验收方式见 [Worker 接入说明](docs/worker-integration.md)。
 
 ## 文档
 

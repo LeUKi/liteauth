@@ -10,6 +10,8 @@ const environments = ['staging', 'production'];
 const paths = Object.fromEntries(['api', 'web'].map(app => [app, resolve(root, `apps/${app}/wrangler.local.jsonc`)]));
 const artifactDirectory = resolve(root, 'apps/web/dist');
 const manifestPath = resolve(root, '.wrangler/staging-artifact.json');
+// Keep this list in sync if the Web Worker entry starts importing local runtime modules.
+const deploymentSourceFiles = ['apps/web/worker.ts', 'pnpm-lock.yaml'];
 function ensure(condition, message) { if (!condition) throw new Error(message); }
 function readConfig(path) {
   ensure(existsSync(path), `Missing local configuration: ${path}`);
@@ -37,12 +39,20 @@ export function validateDeployment(api, web, environment) {
   const prefixes = ['/api/*', '/auth/*', '/oauth2/*', '/.well-known/*'];
   ensure(apiEnv.routes?.length === prefixes.length && prefixes.every(prefix => apiEnv.routes.some(route => route.pattern === origin.hostname + prefix && !route.custom_domain && route.zone_name && (origin.hostname === route.zone_name || origin.hostname.endsWith('.' + route.zone_name)))), 'API routes must cover the four reserved prefixes of APP_ORIGIN');
   ensure(webEnv.routes?.length === 1 && webEnv.routes[0].pattern === origin.hostname && webEnv.routes[0].custom_domain === true, 'Web Custom Domain must match APP_ORIGIN');
+  ensure(web.main === 'worker.ts' && !webEnv.main, 'Web Worker entrypoint must be worker.ts without environment overrides');
+  ensure((webEnv.assets ?? web.assets)?.run_worker_first === true, 'Web assets must run the Worker before static asset handling');
   for (const [kind, config, selected] of [['API', api, apiEnv], ['Web', web, webEnv]]) {
     ensure(typeof selected.name === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(selected.name), `Configure a valid ${kind} Worker name`);
     ensure((selected.workers_dev ?? config.workers_dev) === false && (selected.preview_urls ?? config.preview_urls) === false, `${kind} public preview URLs must be disabled`);
     ensure((selected.observability ?? config.observability)?.enabled === false, `${kind} automatic request logging must be disabled`);
   }
   ensure(apiEnv.name !== webEnv.name, 'API and Web Worker names must differ');
+  const apiBindings = webEnv.services?.filter(binding => binding?.binding === 'API') ?? [];
+  ensure(apiBindings.length === 1, 'Configure exactly one Web Service Binding named API');
+  const apiBinding = apiBindings[0];
+  ensure(apiBinding.service !== webEnv.name, 'Web API Service Binding must not target the Web Worker');
+  ensure(apiBinding.service === apiEnv.name, 'Web API Service Binding must target the selected API Worker');
+  ensure(!apiBinding.environment && !apiBinding.entrypoint, 'Web API Service Binding must not use environment or entrypoint overrides');
   const other = environment === 'staging' ? 'production' : 'staging';
   if (api.env?.[other]) {
     ensure(api.env[other].vars?.APP_ORIGIN !== origin.origin, 'Staging and production must use different origins');
@@ -52,6 +62,14 @@ export function validateDeployment(api, web, environment) {
   const names = [api, web].flatMap(config => environments.flatMap(name => config.env?.[name]?.name ? [config.env[name].name] : []));
   ensure(new Set(names).size === names.length, 'Worker names must be unique across all environments');
   return { environment, origin: origin.origin, apiWorker: apiEnv.name, webWorker: webEnv.name };
+}
+
+export function deploymentSourceHashes() {
+  return deploymentSourceFiles.map(path => {
+    const absolute = resolve(root, path);
+    ensure(existsSync(absolute), `Missing deployment source file: ${path}`);
+    return { path, sha256: createHash('sha256').update(readFileSync(absolute)).digest('hex') };
+  });
 }
 
 export function artifactHashes(directory) {
@@ -74,9 +92,10 @@ export function artifactHashes(directory) {
   return files;
 }
 
-export function verifyStagedArtifact(directory, manifest, origin, version) {
+export function verifyStagedArtifact(directory, manifest, origin, version, sourceFiles = deploymentSourceHashes()) {
   ensure(manifest?.environment === 'staging' && manifest.origin === origin && manifest.version === version, 'Missing or incompatible staging artifact manifest; deploy and verify staging first');
   ensure(JSON.stringify(artifactHashes(directory)) === JSON.stringify(manifest.files), 'Web artifact differs from the staging deployment; redeploy and verify staging first');
+  ensure(JSON.stringify(sourceFiles) === JSON.stringify(manifest.sourceFiles), 'Deployment source differs from the staging deployment; redeploy and verify staging first');
 }
 
 function run(args, cwd = root) {
@@ -95,21 +114,25 @@ export function main(argv) {
   for (const environment of selected ? [selected] : environments) console.log(JSON.stringify(validateDeployment(api, web, environment)));
   if (flags.has('--check')) return;
   const version = JSON.parse(readFileSync(resolve(root, 'apps/web/package.json'), 'utf8')).version;
+  const sourceFiles = deploymentSourceHashes();
   if (selected === 'production') {
     ensure(flags.has('--skip-build'), 'Production requires --skip-build to promote the staged Web artifact');
     ensure(existsSync(manifestPath), 'Deploy and verify staging before production');
-    verifyStagedArtifact(artifactDirectory, JSON.parse(readFileSync(manifestPath, 'utf8')), api.env.staging?.vars?.APP_ORIGIN, version);
+    verifyStagedArtifact(artifactDirectory, JSON.parse(readFileSync(manifestPath, 'utf8')), api.env.staging?.vars?.APP_ORIGIN, version, sourceFiles);
   }
   if (!flags.has('--skip-build')) run(['--filter', '@liteauth/web', 'build']);
+  ensure(JSON.stringify(deploymentSourceHashes()) === JSON.stringify(sourceFiles), 'Deployment source changed during deployment; redeploy and verify staging again');
   const files = artifactHashes(artifactDirectory);
   for (const kind of ['api', 'web']) {
     ensure(JSON.stringify(artifactHashes(artifactDirectory)) === JSON.stringify(files), 'Web artifacts changed during deployment; rebuild and verify staging again');
+    ensure(JSON.stringify(deploymentSourceHashes()) === JSON.stringify(sourceFiles), 'Deployment source changed during deployment; redeploy and verify staging again');
     run(['exec', 'wrangler', 'deploy', '--config', paths[kind], '--env', selected, ...(flags.has('--dry-run') ? ['--dry-run'] : [])], resolve(root, `apps/${kind}`));
   }
   ensure(JSON.stringify(artifactHashes(artifactDirectory)) === JSON.stringify(files), 'Web artifacts changed during deployment; rebuild and verify staging again');
+  ensure(JSON.stringify(deploymentSourceHashes()) === JSON.stringify(sourceFiles), 'Deployment source changed during deployment; redeploy and verify staging again');
   if (selected === 'staging' && !flags.has('--dry-run')) {
     mkdirSync(dirname(manifestPath), { recursive: true });
-    writeFileSync(manifestPath, JSON.stringify({ environment: 'staging', origin: api.env.staging.vars.APP_ORIGIN, version, deployedAt: Math.floor(Date.now() / 1000), files }, null, 2) + '\n', { mode: 0o600 });
+    writeFileSync(manifestPath, JSON.stringify({ environment: 'staging', origin: api.env.staging.vars.APP_ORIGIN, version, deployedAt: Math.floor(Date.now() / 1000), files, sourceFiles }, null, 2) + '\n', { mode: 0o600 });
   }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

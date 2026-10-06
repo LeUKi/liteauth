@@ -1,14 +1,27 @@
-type WebEnvironment = { ASSETS: Fetcher };
+type WebEnvironment = { ASSETS: Fetcher; API?: Fetcher };
+
+const RESERVED_PREFIXES = ['/api', '/auth', '/oauth2', '/.well-known'];
+
+function isReservedPath(pathname: string) {
+  return RESERVED_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+}
+
+function unavailable() {
+  return Response.json(
+    { error: { code: 'service_unavailable', message: '服务暂时不可用' } },
+    { status: 503, headers: { 'Cache-Control': 'no-store' } },
+  );
+}
 
 export default {
   async fetch(request, env) {
     const pathname = new URL(request.url).pathname;
-    const reserved = ['/api', '/auth', '/oauth2', '/.well-known'];
-    if (reserved.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`))) {
-      return Response.json(
-        { error: { code: 'not_found', message: '请求不存在' } },
-        { status: 404, headers: { 'Cache-Control': 'no-store' } },
-      );
+    if (isReservedPath(pathname)) {
+      try {
+        return await env.API?.fetch(request, { redirect: 'manual' }) ?? unavailable();
+      } catch {
+        return unavailable();
+      }
     }
     const response = await env.ASSETS.fetch(request);
     const secured = new Response(response.body, response);

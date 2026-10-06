@@ -70,3 +70,27 @@ staging 和 production 均按“新增字段迁移 → 执行约束的 API/Web �
 协议回归使用隔离的合成身份和真实部署的 HTTP 端点、认证库及 D1；所有临时账号、应用、会话、授权和审计已清理。本轮没有让用户重新完成真人 Connect 登录，不能把这些结果表述为新的真人上游验证。New API 联调及人工实际改名仍按既定边界延期／豁免。
 
 原版本 `0.1.0`、MIT 许可证及仓库可见性保持不变。迁移字段和已确认事实不可清除，API 不能回滚到忽略账号锁定的版本。
+
+## 2026-10-06 同 Zone Worker 接入补丁
+
+Web Worker 对 `/api`、`/auth`、`/oauth2`、`/.well-known` 及其子路径，使用同环境 `API` Service Binding 转发。请求只发送一次，不跟随重定向，直接返回 API 响应；绑定缺失或调用异常返回不可缓存的 JSON 503。保留公网 Routes 和 SPA 路径边界。接入者无需取得 LiteAuth Service Binding，详见 [Worker 接入说明](worker-integration.md)。
+
+发布预检增加服务绑定目标、Worker 优先执行和入口校验；staging 晋级清单增加 Web Worker 入口与锁文件 SHA-256，production 继续复用静态产物。本次沿用 API → Web 发布流程，API 业务代码和数据库结构没有变化，无需迁移。
+
+| 验证 | 本次结果 |
+|---|---|
+| 类型检查、Lint、API/Web 构建 | 通过 |
+| Workers/API 回归 | 235 项通过，含转发与账号准入相关回归 |
+| 部署预检、源码晋级与探针防护测试 | 29 项通过 |
+| Playwright 桌面／移动端 | 64 项通过 |
+| 独立代码与探针审查 | 未发现发布阻断问题 |
+| 修复前同 Zone 对照 | 旧式源站模式的健康检查、Discovery、JWKS、UserInfo 返回 404；严格公网模式通过 |
+| staging／production 公网部署冒烟 | 每个环境 7 组通过 |
+| staging／production 真实同 Zone 调用 | 每个环境分别使用 `global_fetch_private_origin` 与 `global_fetch_strictly_public`；每种模式 7 组基础检查、6 组协议／策略检查全部通过 |
+| 协议／策略范围 | OAuth/OIDC 授权码兑换、Cookie／重定向、UserInfo、错误码与重放拒绝、Lite-only、等级门槛及独立历史令牌 |
+| 实际页面与产物 | 两环境桌面／移动端页面通过，线上 JS/CSS SHA-256 与 staging 清单一致；`build @ 1791263621` |
+| 云端配置 | 两环境 API/Web 新版本均承载 100% 流量；Web 绑定各自 API |
+
+云端协议验收使用独立合成 Lite 会话和实际部署的 HTTP 端点。路由探针确认 ID Token 存在，但不替代完整 JWT 签名验证或真人 Connect 登录；完整协议和账号锁定约束继续由现有 Workers/API 回归覆盖。刻意重放授权码会触发认证库撤销该码衍生的令牌，历史策略检查因此使用另一份未重放的授权。
+
+临时测试账号、应用、会话、授权和相关审计均已按独立测试身份清理并核对为零；临时调用 Worker、路由和探针凭证在验收后移除。版本仍为 `0.1.0`，New API 联调继续延期。本补丁的回滚范围是 Web Worker 和其绑定配置，保留公网 Routes，不回退已有的 API 准入与撤销保护。

@@ -12,9 +12,21 @@
   "observability": {
     "enabled": false
   },
+  "services": [
+    {
+      "binding": "API",
+      "service": "liteauth-api-local"
+    }
+  ],
   "env": {
     "staging": {
       "name": "liteauth-staging-web",
+      "services": [
+        {
+          "binding": "API",
+          "service": "liteauth-staging-api"
+        }
+      ],
       "routes": [
         {
           "pattern": "staging.liteauth.example.com",
@@ -24,6 +36,12 @@
     },
     "production": {
       "name": "liteauth-production-web",
+      "services": [
+        {
+          "binding": "API",
+          "service": "liteauth-production-api"
+        }
+      ],
       "routes": [
         {
           "pattern": "liteauth.example.com",

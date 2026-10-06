@@ -41,6 +41,8 @@ API 环境变量：
 
 Web Worker 使用 Custom Domain；API Worker 使用相同域名下的 `/api/*`、`/auth/*`、`/oauth2/*`、`/.well-known/*` Routes。关闭额外 `workers.dev` / preview URL 和自动请求日志，防止绕过正式入口或记录完整认证 URL。
 
+每个 Web 环境还必须显式配置 `services: [{ "binding": "API", "service": "该环境的 API Worker 名称" }]`。staging 绑定 staging API，production 绑定 production API；部署脚本拒绝缺少、重复、自绑定和跨环境目标。保留 `assets.run_worker_first: true`，让四组保留路径在静态资源处理前通过 Service Binding 转发。公网 Routes 继续保留；本地 Vite 代理不变。原理与验证边界见 [Worker 接入说明](worker-integration.md)。
+
 ## Secrets 与迁移
 
 每个 API 环境都需要以下 Secrets：
@@ -86,9 +88,9 @@ pnpm deploy:production --skip-build
 node scripts/verify-deployment.mjs https://liteauth.example.com
 ```
 
-部署脚本先发布 API，再发布 Web。成功发布 staging 后会在被忽略的 `.wrangler` 目录记录前端文件哈希清单；production 强制要求 `--skip-build`，并拒绝缺少清单、环境或版本不匹配、产物被重新构建或修改的情况。清单证明复用了 staging 产物，实际业务冒烟仍需执行。`--dry-run` 只在本地构建和验证，不发布远端；`--skip-build` 复用 `apps/web/dist`。脚本不自动导入 Secrets、不自动应用迁移。协议交互验证可运行 `node scripts/verify-oidc.mjs --help`，凭据通过受保护文件传入。
+部署脚本先发布 API，再发布 Web。成功发布 staging 后会在被忽略的 `.wrangler` 目录记录前端文件哈希清单、Web Worker 入口源码和锁文件哈希；production 强制要求 `--skip-build`，并拒绝缺少清单、环境或版本不匹配、源码或产物被修改的情况。旧版缺少源码哈希的清单需要重新发布 staging。清单证明复用了 staging 产物和转发代码，实际业务冒烟仍需执行。`--dry-run` 只在本地构建和验证，不发布远端；`--skip-build` 复用 `apps/web/dist`。脚本不自动导入 Secrets、不自动应用迁移。协议交互验证可运行 `node scripts/verify-oidc.mjs --help`，凭据通过受保护文件传入。
 
-发布时只运行一个部署进程，不同时重建或修改 `dist`。脚本在上传前后再次比对文件哈希，发现变化会中止并要求重新验证 staging；API 由当前源码构建，前端清单不代表 API 字节产物。
+发布时只运行一个部署进程，不同时重建或修改 `dist`、Web Worker 入口或锁文件。脚本在上传前后再次比对哈希，发现变化会中止并要求重新验证 staging；API 由当前源码构建，前端清单不代表 API 字节产物。修改 Worker 入口依赖结构时，还需同步扩展源码指纹覆盖范围。
 
 ## 账号非 Lite 验证锁定与历史回填
 

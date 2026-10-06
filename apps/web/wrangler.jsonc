@@ -12,6 +12,12 @@
   "observability": {
     "enabled": false
   },
+  "services": [
+    {
+      "binding": "API",
+      "service": "liteauth-api-local"
+    }
+  ],
   "workers_dev": false,
   "preview_urls": false
 }

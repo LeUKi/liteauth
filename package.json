@@ -19,7 +19,7 @@
     "deploy:check": "node scripts/deploy.mjs --check",
     "deploy:staging": "node scripts/deploy.mjs --env staging",
     "deploy:production": "node scripts/deploy.mjs --env production",
-    "test:deployment": "node --test scripts/deploy.test.mjs"
+    "test:deployment": "node --test scripts/deploy.test.mjs scripts/same-zone-probe/worker.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

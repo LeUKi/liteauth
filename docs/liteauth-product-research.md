@@ -122,6 +122,8 @@ flowchart LR
     U[浏览器与下游客户端] --> E[Cloudflare 同域路由]
     E -->|页面与静态资源| W[前端 Worker / Static Assets]
     E -->|API、认证与发现端点| A[后端 Hono Worker]
+    Z[同 Zone Worker 的源站请求] --> W
+    W -->|保留路径 / Service Binding| A
     W --> V[React SPA]
     A --> D[(D1 / Drizzle)]
     A --> S[Workers Secrets]
@@ -130,6 +132,8 @@ flowchart LR
 ```
 
 前端 Worker 通过 Custom Domain 承载 `liteauth.example.com`。后端 Worker 通过更具体的同域 Routes 接管 `/api/*`、`/auth/*`、`/oauth2/*`、`/.well-known/*`。Cloudflare 官方文档明确支持 Routes 与 Custom Domain 在同一主机名下组合，前者优先。验证环境使用 `staging.liteauth.example.com`，配备独立 Worker、D1 与凭据，不能复用生产认证数据。[S6](#s6)
+
+同 Zone Worker 的旧式全局 `fetch()` 可能直接进入 Custom Domain 的前端 Worker，跳过公网 Routes。前端对四组保留路径及裸前缀，通过名为 `API` 的 Service Binding 转发到同环境后端，保留原请求和响应；公网 Routes 继续保留。环境绑定、调用方兼容标志和真实云端验证见 [Worker 接入说明](worker-integration.md)。
 
 实施约束：
 
